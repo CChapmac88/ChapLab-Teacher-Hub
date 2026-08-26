@@ -18,7 +18,23 @@ try:
 except Exception:
     create_client=None
 
-st.set_page_config(page_title="ChapLab Teacher Hub", page_icon="📘", layout="wide")
+st.set_page_config(page_title="ChapLab Teacher Hub", page_icon="📘", layout="wide", initial_sidebar_state="expanded")
+
+st.markdown("""
+<style>
+section[data-testid="stSidebar"]{
+    display:block !important;
+    visibility:visible !important;
+    opacity:1 !important;
+    transform:none !important;
+}
+section[data-testid="stSidebar"] > div{
+    display:block !important;
+    visibility:visible !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 
 LEGACY_DB = Path("teacher_tracker.db")
 WEB_DB = Path(tempfile.gettempdir()) / "chaplab_teacher_tracker.db"
@@ -285,7 +301,7 @@ st.markdown("""
 header[data-testid="stHeader"]{
   background:rgba(255,255,255,.94);backdrop-filter:blur(8px);border-bottom:1px solid #edf0f4;
 }
-section[data-testid="stSidebar"],[data-testid="collapsedControl"]{display:none!important}
+
 .block-container{
   max-width:1450px!important;margin:0 auto!important;padding:120px 34px 52px 300px!important;
   background:transparent!important;border:none!important;box-shadow:none!important;
@@ -2272,6 +2288,35 @@ if records:
                 st.session_state["nav_page"]="Class Dashboard"
                 st.session_state["class_binder_tool"]="Overview"
                 st.rerun()
+
+
+# Visible navigation fallback: always available in the page itself.
+st.markdown("### Navigation")
+_nav_labels=[
+    ("🏠 Dashboard","Home Page"),
+    ("🎓 Scholars","Scholars"),
+    ("Ⓐ Grades","Scholar Binder"),
+    ("📚 Book Leveler","Book Leveler"),
+    ("👥 Student Grouping","Student Grouping"),
+    ("📝 Report Comments","Report Card Comments"),
+    ("✨ Little Assistant","Little Assistant"),
+    ("💬 Communication","Communication Log"),
+    ("⚙️ Web & Backup","Web & Backup"),
+]
+_nav_cols=st.columns(3)
+for i,(label,target) in enumerate(_nav_labels):
+    with _nav_cols[i % 3]:
+        if st.button(
+            label,
+            key=f"visible_nav_{target}",
+            use_container_width=True,
+            type="primary" if page==target else "secondary"
+        ):
+            st.session_state["nav_page"]=target
+            if target=="Scholar Binder":
+                st.session_state["class_binder_tool"]="Overview"
+            st.rerun()
+st.markdown("---")
 
 # ---------- Pages ----------
 if page=="Home Page":
