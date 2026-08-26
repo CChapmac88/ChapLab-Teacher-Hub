@@ -1,7 +1,7 @@
 
 import streamlit as st
 import sqlite3, json, os, re, tempfile, shutil, threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from io import BytesIO
 from difflib import SequenceMatcher
@@ -559,6 +559,29 @@ def init_db():
         updated_at TEXT DEFAULT '',
         updated_by TEXT DEFAULT ''
     );
+    CREATE TABLE IF NOT EXISTS staff_accounts(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL UNIQUE,
+        display_name TEXT DEFAULT '',
+        role_type TEXT DEFAULT 'Teacher',
+        grade_band TEXT DEFAULT '',
+        subjects TEXT DEFAULT '',
+        approval_status TEXT DEFAULT 'Pending',
+        active INTEGER DEFAULT 1,
+        created_at TEXT DEFAULT '',
+        approved_at TEXT DEFAULT '',
+        approved_by TEXT DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS staff_role_assignments(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        grade_band TEXT NOT NULL,
+        role_name TEXT NOT NULL,
+        staff_email TEXT NOT NULL,
+        staff_name TEXT DEFAULT '',
+        assigned_by TEXT DEFAULT '',
+        assigned_at TEXT DEFAULT '',
+        active INTEGER DEFAULT 1
+    );
     CREATE TABLE IF NOT EXISTS communications(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         scholar_id INTEGER, guardian_id INTEGER,
@@ -782,6 +805,9 @@ def init_db():
     addcol(cur,"book_catalog","fp_level","TEXT DEFAULT ''")
     addcol(cur,"book_catalog","isbn","TEXT DEFAULT ''")
     addcol(cur,"book_catalog","notes","TEXT DEFAULT ''")
+    addcol(cur,"classes","is_demo","INTEGER DEFAULT 0")
+    addcol(cur,"scholars","is_demo","INTEGER DEFAULT 0")
+    addcol(cur,"assignments","is_demo","INTEGER DEFAULT 0")
     addcol(cur,"assignments","include_in_average","INTEGER DEFAULT 1")
     addcol(cur,"communications","guardian_id","INTEGER")
     addcol(cur,"support_notes","concern_category","TEXT DEFAULT ''")
@@ -3155,7 +3181,199 @@ def applicable_newsletter_requests(author_key,profile):
             keep.append(r)
     return pd.DataFrame(keep) if keep else pd.DataFrame(columns=df.columns)
 
+
+# ---------- Demo Data + Team Role Management ----------
+DEMO_CLASS_NAME="ChapLab Demo Class"
+
+def approved_staff_df():
+    c=conn()
+    df=pd.read_sql_query(
+        """SELECT * FROM staff_accounts
+           WHERE active=1 AND approval_status='Approved'
+           ORDER BY display_name,email""",c
+    )
+    c.close()
+    return df
+
+def role_assignments_df(active_only=True):
+    c=conn()
+    q="SELECT * FROM staff_role_assignments"
+    if active_only:
+        q+=" WHERE active=1"
+    q+=" ORDER BY grade_band,role_name,staff_name"
+    df=pd.read_sql_query(q,c)
+    c.close()
+    return df
+
+def assign_team_role(grade_band,role_name,staff_email,staff_name):
+    c=conn()
+    # One active Grade Team Leader per grade band; one Newsletter Lead per grade band.
+    c.execute(
+        """UPDATE staff_role_assignments SET active=0
+           WHERE grade_band=? AND role_name=? AND active=1""",
+        (grade_band,role_name)
+    )
+    c.execute(
+        """INSERT INTO staff_role_assignments(
+           grade_band,role_name,staff_email,staff_name,assigned_by,assigned_at,active)
+           VALUES (?,?,?,?,?,?,1)""",
+        (grade_band,role_name,staff_email,staff_name,current_author_name(),
+         datetime.now().isoformat(timespec="minutes"))
+    )
+    c.commit(); c.close()
+
+def demo_setting():
+    c=conn()
+    rows=c.execute(
+        "SELECT key,value FROM settings WHERE key IN ('demo_enabled','demo_grade')"
+    ).fetchall()
+    c.close()
+    out={"enabled":False,"grade":"Grade 3"}
+    for r in rows:
+        try:
+            val=json.loads(r["value"])
+        except:
+            val=r["value"]
+        if r["key"]=="demo_enabled":
+            out["enabled"]=bool(val)
+        elif r["key"]=="demo_grade":
+            out["grade"]=str(val or "Grade 3")
+    return out
+
+def save_demo_setting(enabled,grade):
+    c=conn()
+    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES ('demo_enabled',?)",(json.dumps(bool(enabled)),))
+    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES ('demo_grade',?)",(json.dumps(str(grade)),))
+    c.commit(); c.close()
+
+def ensure_demo_data(grade_label="Grade 3"):
+    """Create/update one isolated demo class with 3 fake scholars and 4 assignments."""
+    grade_num=re.sub(r'[^0-9Kk]','',str(grade_label)).upper() or "3"
+    class_label=f"{DEMO_CLASS_NAME} — {grade_label}"
+
+    c=conn()
+    row=c.execute("SELECT id FROM classes WHERE is_demo=1 ORDER BY id LIMIT 1").fetchone()
+    if row:
+        cid=int(row["id"])
+        c.execute("UPDATE classes SET class_name=?,subject_note=?,active=1,is_demo=1 WHERE id=?",
+                  (class_label,"Demo data only",cid))
+    else:
+        cur=c.execute(
+            "INSERT INTO classes(class_name,subject_note,active,is_demo) VALUES (?,?,1,1)",
+            (class_label,"Demo data only")
+        )
+        cid=int(cur.lastrowid)
+
+    # Clear prior demo children/assignments for a deterministic reset.
+    old_sids=[int(r["id"]) for r in c.execute("SELECT id FROM scholars WHERE is_demo=1").fetchall()]
+    old_aids=[int(r["id"]) for r in c.execute("SELECT id FROM assignments WHERE is_demo=1").fetchall()]
+    if old_sids:
+        marks=",".join(["?"]*len(old_sids))
+        c.execute(f"DELETE FROM grades WHERE scholar_id IN ({marks})",old_sids)
+        c.execute(f"DELETE FROM benchmark_scores WHERE scholar_id IN ({marks})",old_sids)
+        c.execute(f"DELETE FROM iready_scores WHERE scholar_id IN ({marks})",old_sids)
+        c.execute(f"DELETE FROM scholars WHERE id IN ({marks})",old_sids)
+    if old_aids:
+        marks=",".join(["?"]*len(old_aids))
+        c.execute(f"DELETE FROM grades WHERE assignment_id IN ({marks})",old_aids)
+        c.execute(f"DELETE FROM assignments WHERE id IN ({marks})",old_aids)
+
+    demo_students=[
+        ("Maya","Johnson","she/her"),
+        ("Noah","Williams","he/him"),
+        ("Jordan","Taylor","they/them"),
+    ]
+    sids=[]
+    for first,last,pron in demo_students:
+        cur=c.execute(
+            """INSERT INTO scholars(first_name,last_name,class_name,active,class_id,
+               school_name,academic_year,grade_level,student_id,pronouns,is_demo)
+               VALUES (?,?,?,1,?,?,?,?,?,?,1)""",
+            (first,last,class_label,cid,"ChapLab Demo School",current_academic_year(),
+             grade_label,f"DEMO-{len(sids)+1:03d}",pron)
+        )
+        sids.append(int(cur.lastrowid))
+
+    # Four cross-subject assignments.
+    assignment_specs=[
+        ("Reading Response","ELA","Classwork","3R3",20.0),
+        ("Math Skills Check","Math","Assessment","NY-3.OA.1",20.0),
+        ("Science Investigation","Science","Classwork","3-PS2-2",20.0),
+        ("Community Exit Ticket","Social Studies","Quiz","SS3-COMM",20.0),
+    ]
+    aids=[]
+    today=date.today()
+    for i,(title,subject,category,std,pts) in enumerate(assignment_specs):
+        adate=str(today-timedelta(days=(3-i)*3))
+        cur=c.execute(
+            """INSERT INTO assignments(
+               title,subject,category,standard_code,points_possible,assignment_date,
+               class_id,marking_period,include_in_average,is_demo)
+               VALUES (?,?,?,?,?,?,?,?,1,1)""",
+            (title,subject,category,std,pts,adate,cid,
+             quarter_for_date(adate,current_academic_year()) or "Quarter 1")
+        )
+        aids.append(int(cur.lastrowid))
+
+    # Scores intentionally varied so dashboards/gradebook show something meaningful.
+    score_grid=[
+        [19,18,20,17],  # Maya
+        [14,16,15,13],  # Noah
+        [17,12,18,16],  # Jordan
+    ]
+    for sid,row_scores in zip(sids,score_grid):
+        for aid,score in zip(aids,row_scores):
+            c.execute(
+                "INSERT OR REPLACE INTO grades(scholar_id,assignment_id,points_earned) VALUES (?,?,?)",
+                (sid,aid,float(score))
+            )
+
+    # Demonstration benchmark data.
+    nwea_rows=[
+        ("188","194","201","202","190","197","204","205","M","N","O"),
+        ("176","181","187","194","179","184","190","196","K","L","M"),
+        ("183","190","198","200","181","189","197","202","L","M","N"),
+    ]
+    for sid,vals in zip(sids,nwea_rows):
+        c.execute("""INSERT INTO benchmark_scores(
+            scholar_id,nwea_fall_reading,nwea_winter_reading,nwea_spring_reading,
+            nwea_reading_goal,nwea_fall_math,nwea_winter_math,nwea_spring_math,nwea_math_goal,
+            fp_fall_level,fp_winter_level,fp_spring_level)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (sid,*vals)
+        )
+
+    c.commit(); c.close()
+    return cid
+
+def set_demo_mode(enabled,grade_label):
+    save_demo_setting(enabled,grade_label)
+    c=conn()
+    if enabled:
+        c.close()
+        cid=ensure_demo_data(grade_label)
+        st.session_state["selected_class"]=cid
+        return cid
+    c.execute("UPDATE classes SET active=0 WHERE is_demo=1")
+    c.execute("UPDATE scholars SET active=0 WHERE is_demo=1")
+    c.commit(); c.close()
+    if st.session_state.get("selected_class"):
+        c=conn()
+        r=c.execute("SELECT is_demo FROM classes WHERE id=?",(int(st.session_state["selected_class"]),)).fetchone()
+        c.close()
+        if r and int(r["is_demo"] or 0)==1:
+            st.session_state["selected_class"]=0
+    return None
+
 # ---------- App Shell ----------
+# Honor saved Demo Mode without touching real data.
+_demo_state=demo_setting()
+if not _demo_state["enabled"]:
+    _c=conn()
+    _c.execute("UPDATE classes SET active=0 WHERE is_demo=1")
+    _c.execute("UPDATE scholars SET active=0 WHERE is_demo=1")
+    _c.commit(); _c.close()
+
 cdf=classes_df()
 folder={0:"All Classes", **{int(r.id):r.class_name for _,r in cdf.iterrows()}}
 
@@ -3387,6 +3605,84 @@ with st.container(border=True):
                 "Current plan: Creator → Creator + Grade Team → Creator + Grade Team + Dean. "
                 "Dean/SPED Dean/cross-program features remain hidden until you turn them on."
             )
+
+
+            st.markdown("---")
+            st.markdown("#### 🎭 Demo Class")
+            st.caption(
+                "Turn on a safe fake class for demonstrations. Demo data is tagged separately "
+                "and can be hidden again without touching real classes or scholars."
+            )
+            demo=demo_setting()
+            dm1,dm2=st.columns(2)
+            demo_enabled=dm1.toggle("Show Demo Class",value=bool(demo["enabled"]),key="creator_demo_enabled")
+            demo_grade=dm2.selectbox(
+                "Demo grade",
+                ["Kindergarten","Grade 1","Grade 2","Grade 3","Grade 4","Grade 5","Grade 6","Grade 7","Grade 8"],
+                index=(["Kindergarten","Grade 1","Grade 2","Grade 3","Grade 4","Grade 5","Grade 6","Grade 7","Grade 8"].index(demo["grade"])
+                       if demo["grade"] in ["Kindergarten","Grade 1","Grade 2","Grade 3","Grade 4","Grade 5","Grade 6","Grade 7","Grade 8"] else 3),
+                key="creator_demo_grade"
+            )
+            if st.button("Apply Demo Class Setting",key="apply_demo_setting",use_container_width=True):
+                cid=set_demo_mode(demo_enabled,demo_grade)
+                st.success(
+                    f"Demo Class is {'ON' if demo_enabled else 'OFF'}."
+                    + (f" Opened {demo_grade} demo data." if demo_enabled else "")
+                )
+                st.rerun()
+
+            if demo_enabled:
+                st.info(
+                    "Demo contains 3 fake scholars, 4 assignments across ELA/Math/Science/Social Studies, "
+                    "sample grades, and sample reading/assessment data."
+                )
+
+            st.markdown("---")
+            st.markdown("#### 👥 Team & Role Management")
+            st.caption(
+                "Until the Dean role is released, Creator/Admin controls Grade Team Leader and Newsletter Lead assignments. "
+                "When Dean is enabled, this same structure will move to the appropriate Dean permissions."
+            )
+            staff=approved_staff_df()
+            if staff.empty:
+                st.info(
+                    "Role framework is ready. There are no approved staff accounts yet because self-signup is still OFF. "
+                    "Once approved accounts exist, they will appear here automatically."
+                )
+            else:
+                grade_band=st.selectbox(
+                    "Grade band / team",
+                    ["Kindergarten","Grade 1","Grade 2","Grade 3","Grade 4","Grade 5","Grade 6","Grade 7","Grade 8",
+                     "Special Areas","Intervention / Student Support","Other / Custom"],
+                    key="role_grade_band"
+                )
+                custom_band=st.text_input("Other / custom grade band",key="role_grade_band_other")
+                final_band=custom_band.strip() if grade_band=="Other / Custom" and custom_band.strip() else grade_band
+                staff_ids=list(staff.index)
+                selected_idx=st.selectbox(
+                    "Approved staff member",
+                    staff_ids,
+                    format_func=lambda i:f"{staff.loc[i,'display_name']} ({staff.loc[i,'email']})",
+                    key="role_staff_member"
+                )
+                staff_row=staff.loc[selected_idx]
+                rr1,rr2=st.columns(2)
+                if rr1.button("Assign Grade Team Leader",key="assign_grade_team_leader",use_container_width=True):
+                    assign_team_role(final_band,"Grade Team Leader",staff_row["email"],staff_row["display_name"])
+                    st.success(f"{staff_row['display_name']} assigned as {final_band} Grade Team Leader.")
+                    st.rerun()
+                if rr2.button("Assign Newsletter Lead",key="assign_newsletter_lead",use_container_width=True):
+                    assign_team_role(final_band,"Newsletter Lead",staff_row["email"],staff_row["display_name"])
+                    st.success(f"{staff_row['display_name']} assigned as {final_band} Newsletter Lead.")
+                    st.rerun()
+
+            roles=role_assignments_df(True)
+            if not roles.empty:
+                st.markdown("##### Current Team Roles")
+                st.dataframe(
+                    roles[["grade_band","role_name","staff_name","staff_email","assigned_by","assigned_at"]],
+                    hide_index=True,use_container_width=True
+                )
 
 _nav=[("🏠 Dashboard","Home Page"),("🎓 Scholars","Scholars"),("Ⓐ Grades","Scholar Binder"),("📚 Book Leveler","Book Leveler"),("👥 Student Grouping","Student Grouping"),("📝 Report Comments","Report Card Comments"),("✨ Little Assistant","Little Assistant"),("📌 Bulletin Board","Bulletin Board"),("💬 Communication","Communication Log"),("⚙️ Web & Backup","Web & Backup")]
 cols=st.columns(10)
@@ -3665,6 +3961,7 @@ if page=="Home Page":
         with tabs[3]:
             st.markdown("### Newsletter Lead Workspace")
             st.caption("Newsletter Lead can set submission deadlines, assign who needs to submit, edit submitted blurbs, and finalize newsletter copy.")
+            st.caption("Role path: Creator/Admin assigns the Grade Team Leader until Dean is released. The Grade Team Leader may serve as Newsletter Lead or assign another approved staff member in that grade band.")
 
             st.markdown("#### 📅 Create Newsletter Request / Due Date")
             with st.form("newsletter_request_form",clear_on_submit=True):
