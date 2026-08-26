@@ -3407,343 +3407,338 @@ elif page=="Scholar Binder":
                 save_setting("scale",[[str(r.Letter),float(r.Minimum),float(r.Maximum)] for _,r in se.iterrows()]); st.success("Saved.")
 elif page=="Book Leveler":
     st.markdown('<div class="page-title">Book Leveler</div><div class="page-subtitle">Search books online, save verified F&P levels, and check fit for a scholar.</div>',unsafe_allow_html=True)
-    if not selected_class:
-        st.info("Choose a class first.")
+    st.markdown("## 📚 Book Level Checker")
+    st.caption(
+        "Search Open Library by title or ISBN and save verified F&P levels anytime. "
+        "When scholars are added, ChapLab will also compare books with their current reading level."
+    )
+
+    roster=scholars_df(selected_class or None)
+    current_fp=""
+    scholar_name=""
+
+    if roster.empty:
+        st.info("No scholars yet — book search and My Book Catalog are still fully available. Scholar reading-level comparisons will appear automatically after a roster is added.")
     else:
-        st.markdown("## 📚 Book Level Checker")
-        st.caption(
-            "Search Open Library by title or ISBN, save books to your ChapLab catalog, "
-            "and compare verified F&P levels with a scholar's current level."
+        sid=st.selectbox(
+            "Compare book with scholar (optional)",
+            list(roster.id.astype(int)),
+            format_func=lambda x:nm(roster[roster.id==x].iloc[0]),
+            key="book_checker_student_v32"
+        )
+        scholar_name=nm(roster[roster.id==sid].iloc[0])
+        br=benchmark_for_scholar(sid)
+        if br:
+            current_fp=(br["fp_spring_level"] or br["fp_fall_level"] or "").strip().upper()
+
+        if current_fp:
+            st.success(f"{scholar_name}'s current F&P level: **{current_fp}**")
+        else:
+            st.caption(f"No F&P level is saved for {scholar_name} yet. You can still search and save books.")
+
+    tabs=st.tabs(["Search Internet","My Book Catalog"])
+
+    with tabs[0]:
+        st.markdown("### Search Open Library")
+
+        # Camera is intentionally user-activated. It is NOT rendered
+        # until the teacher clicks the button below.
+        if st.button("📷 Scan ISBN with Camera",key="toggle_book_camera"):
+            st.session_state["show_book_camera"]=not st.session_state.get("show_book_camera",False)
+            st.rerun()
+
+        if st.session_state.get("show_book_camera",False):
+            with st.container(border=True):
+                cam_top1,cam_top2=st.columns([5,1])
+                cam_top1.markdown("#### 📷 ISBN Camera")
+                if cam_top2.button("✕ Close",key="close_book_camera"):
+                    st.session_state["show_book_camera"]=False
+                    st.rerun()
+                st.caption("Point the camera at the ISBN barcode. The camera stays off unless you open it.")
+                camera_photo=st.camera_input(
+                    "Capture the ISBN barcode",
+                    key="book_isbn_camera_capture"
+                )
+                if camera_photo is not None:
+                    st.success("Barcode photo captured.")
+                    st.caption("Type the ISBN printed above the barcode below to search for the book.")
+                    captured_isbn=st.text_input(
+                        "ISBN from captured book",
+                        placeholder="978...",
+                        key="book_camera_isbn"
+                    )
+                    cleaned_camera_isbn=re.sub(r"[^0-9Xx]","",captured_isbn or "")
+                    if st.button("Find Captured Book",key="find_camera_book"):
+                        if len(cleaned_camera_isbn) not in (10,13):
+                            st.warning("Enter a valid 10- or 13-digit ISBN.")
+                        else:
+                            try:
+                                found=openlibrary_lookup_isbn(cleaned_camera_isbn)
+                                st.session_state["book_online_results"]=[found] if found else []
+                                if not found:
+                                    st.warning("No matching book was found.")
+                            except Exception as e:
+                                st.error(str(e))
+
+        search_mode=st.radio(
+            "Search by",
+            ["Title / Author / Keyword","ISBN"],
+            horizontal=True,
+            key="book_online_search_mode"
         )
 
-        roster=scholars_df(selected_class)
-        if roster.empty:
-            st.info("No scholars are available in this class.")
-        else:
-            sid=st.selectbox(
-                "Scholar",
-                list(roster.id.astype(int)),
-                format_func=lambda x:nm(roster[roster.id==x].iloc[0]),
-                key="book_checker_student_v32"
+        q=st.text_input(
+            "Book title, author, keywords, or ISBN",
+            placeholder="Example: Charlotte's Web or 9780064400558",
+            key="book_online_query"
+        )
+
+        if st.button("Search Internet",key="book_search_internet"):
+            try:
+                if search_mode=="ISBN":
+                    result=openlibrary_lookup_isbn(q)
+                    st.session_state["book_online_results"]=[result] if result else []
+                else:
+                    st.session_state["book_online_results"]=openlibrary_search_books(q,limit=10)
+                if not st.session_state["book_online_results"]:
+                    st.warning("No matching books were found.")
+            except Exception as e:
+                st.error(str(e))
+
+        online_results=st.session_state.get("book_online_results",[])
+        if online_results:
+            labels=[]
+            for i,b in enumerate(online_results):
+                title=b.get("title") or "Untitled"
+                author=b.get("author") or "Unknown author"
+                year=b.get("year") or b.get("publish_date") or ""
+                isbn=b.get("isbn") or ""
+                label=f"{title} — {author}"
+                if year:
+                    label+=f" ({year})"
+                if isbn:
+                    label+=f" | ISBN {isbn}"
+                labels.append(label)
+
+            idx=st.selectbox(
+                "Select a result",
+                list(range(len(online_results))),
+                format_func=lambda x:labels[x],
+                key="book_online_result_select"
             )
-            scholar_name=nm(roster[roster.id==sid].iloc[0])
-            br=benchmark_for_scholar(sid)
-            current_fp=""
-            if br:
-                current_fp=(br["fp_spring_level"] or br["fp_fall_level"] or "").strip().upper()
+            book=online_results[idx]
 
-            if current_fp:
-                st.success(f"{scholar_name}'s current F&P level: **{current_fp}**")
-            else:
-                st.warning(
-                    f"No F&P level is saved for {scholar_name}. "
-                    "You can still search books, but the reading-level comparison will be limited."
-                )
+            cover_url=book.get("cover_url") or openlibrary_cover_url(book)
+            c1,c2=st.columns([1,2])
+            with c1:
+                if cover_url:
+                    st.image(cover_url,width=180)
+                else:
+                    st.caption("No cover image available.")
+            with c2:
+                st.markdown(f"**Title:** {book.get('title') or 'Untitled'}")
+                st.write(f"**Author:** {book.get('author') or 'Unknown'}")
+                if book.get("publisher"):
+                    st.write(f"**Publisher:** {book.get('publisher')}")
+                if book.get("year") or book.get("publish_date"):
+                    st.write(f"**Published:** {book.get('year') or book.get('publish_date')}")
+                if book.get("isbn"):
+                    st.write(f"**ISBN:** {book.get('isbn')}")
 
-            tabs=st.tabs(["Search Internet","My Book Catalog"])
+            st.info(
+                "Open Library does not reliably provide Fountas & Pinnell levels. "
+                "ChapLab will not guess an F&P level. Enter a verified level if you know it, "
+                "then save the book so future checks are automatic."
+            )
 
-            with tabs[0]:
-                st.markdown("### Search Open Library")
+            verified_fp=st.text_input(
+                "Verified F&P level (optional)",
+                placeholder="Example: M",
+                key="book_verified_fp_online"
+            ).strip().upper()
 
-                # Camera is intentionally user-activated. It is NOT rendered
-                # until the teacher clicks the button below.
-                if st.button("📷 Scan ISBN with Camera",key="toggle_book_camera"):
-                    st.session_state["show_book_camera"]=not st.session_state.get("show_book_camera",False)
-                    st.rerun()
+            notes=st.text_area(
+                "Book notes",
+                placeholder="Optional notes about this edition, classroom use, or source of the verified level.",
+                height=80,
+                key="book_online_notes"
+            )
 
-                if st.session_state.get("show_book_camera",False):
-                    with st.container(border=True):
-                        cam_top1,cam_top2=st.columns([5,1])
-                        cam_top1.markdown("#### 📷 ISBN Camera")
-                        if cam_top2.button("✕ Close",key="close_book_camera"):
-                            st.session_state["show_book_camera"]=False
-                            st.rerun()
-                        st.caption("Point the camera at the ISBN barcode. The camera stays off unless you open it.")
-                        camera_photo=st.camera_input(
-                            "Capture the ISBN barcode",
-                            key="book_isbn_camera_capture"
+            if verified_fp and not re.fullmatch(r"[A-Z]",verified_fp):
+                st.warning("For automatic comparison, use a single F&P letter level A–Z.")
+
+            if verified_fp and current_fp:
+                relation=fp_level_relation(current_fp,verified_fp)
+                if relation:
+                    label,diff=relation
+                    if diff==0:
+                        st.success(f"This book is **on {scholar_name}'s current F&P level ({current_fp})**.")
+                    elif diff<0:
+                        st.info(
+                            f"This book is **{label.lower()}** for {scholar_name}: "
+                            f"book {verified_fp}, scholar {current_fp}."
                         )
-                        if camera_photo is not None:
-                            st.success("Barcode photo captured.")
-                            st.caption("Type the ISBN printed above the barcode below to search for the book.")
-                            captured_isbn=st.text_input(
-                                "ISBN from captured book",
-                                placeholder="978...",
-                                key="book_camera_isbn"
-                            )
-                            cleaned_camera_isbn=re.sub(r"[^0-9Xx]","",captured_isbn or "")
-                            if st.button("Find Captured Book",key="find_camera_book"):
-                                if len(cleaned_camera_isbn) not in (10,13):
-                                    st.warning("Enter a valid 10- or 13-digit ISBN.")
-                                else:
-                                    try:
-                                        found=openlibrary_lookup_isbn(cleaned_camera_isbn)
-                                        st.session_state["book_online_results"]=[found] if found else []
-                                        if not found:
-                                            st.warning("No matching book was found.")
-                                    except Exception as e:
-                                        st.error(str(e))
+                    else:
+                        st.warning(
+                            f"This book is **{label.lower()}** for {scholar_name}: "
+                            f"book {verified_fp}, scholar {current_fp}."
+                        )
 
-                search_mode=st.radio(
-                    "Search by",
-                    ["Title / Author / Keyword","ISBN"],
-                    horizontal=True,
-                    key="book_online_search_mode"
+            if st.button("Save to My Book Catalog",key="save_online_book"):
+                c=conn()
+                # Inspect catalog columns dynamically so this remains compatible
+                # with earlier ChapLab database versions.
+                cols=[r["name"] for r in c.execute("PRAGMA table_info(book_catalog)").fetchall()]
+                title=(book.get("title") or "Untitled").strip()
+                author=(book.get("author") or "").strip()
+                isbn=(book.get("isbn") or "").strip()
+
+                existing=None
+                if isbn and "isbn" in cols:
+                    existing=c.execute(
+                        "SELECT id FROM book_catalog WHERE isbn=? LIMIT 1",
+                        (isbn,)
+                    ).fetchone()
+                if not existing:
+                    existing=c.execute(
+                        "SELECT id FROM book_catalog WHERE lower(title)=lower(?) AND lower(COALESCE(author,''))=lower(?) LIMIT 1",
+                        (title,author)
+                    ).fetchone()
+
+                if existing:
+                    sets=[]
+                    vals=[]
+                    if "fp_level" in cols:
+                        sets.append("fp_level=?"); vals.append(verified_fp)
+                    if "isbn" in cols:
+                        sets.append("isbn=?"); vals.append(isbn)
+                    if "notes" in cols:
+                        sets.append("notes=?"); vals.append(notes.strip())
+                    if sets:
+                        vals.append(int(existing["id"]))
+                        c.execute(f"UPDATE book_catalog SET {','.join(sets)} WHERE id=?",vals)
+                    st.success("Book already existed; saved information was updated.")
+                else:
+                    insert_cols=["title"]
+                    insert_vals=[title]
+                    if "author" in cols:
+                        insert_cols.append("author"); insert_vals.append(author)
+                    if "fp_level" in cols:
+                        insert_cols.append("fp_level"); insert_vals.append(verified_fp)
+                    if "isbn" in cols:
+                        insert_cols.append("isbn"); insert_vals.append(isbn)
+                    if "notes" in cols:
+                        insert_cols.append("notes"); insert_vals.append(notes.strip())
+                    placeholders=",".join(["?"]*len(insert_cols))
+                    c.execute(
+                        f"INSERT INTO book_catalog({','.join(insert_cols)}) VALUES ({placeholders})",
+                        insert_vals
+                    )
+                    st.success("Book saved to your ChapLab catalog.")
+                c.commit(); c.close()
+                st.rerun()
+
+    with tabs[1]:
+        st.markdown("### My Book Catalog")
+        c=conn()
+        catalog=pd.read_sql_query("SELECT * FROM book_catalog ORDER BY title",c)
+        c.close()
+
+        if catalog.empty:
+            st.caption("Your book catalog is empty. Use Search Internet to add books.")
+        else:
+            search_local=st.text_input(
+                "Search saved books",
+                placeholder="Type title or author",
+                key="book_catalog_search_v32"
+            )
+            filtered=catalog.copy()
+            if search_local.strip():
+                mask=filtered["title"].astype(str).str.contains(search_local,case=False,na=False)
+                if "author" in filtered.columns:
+                    mask=mask | filtered["author"].astype(str).str.contains(search_local,case=False,na=False)
+                filtered=filtered[mask]
+
+            if filtered.empty:
+                st.warning("No saved books match that search.")
+            else:
+                bid=st.selectbox(
+                    "Saved book",
+                    list(filtered.id.astype(int)),
+                    format_func=lambda x:(
+                        f"{filtered[filtered.id==x].iloc[0].title}"
+                        + (
+                            f" — {filtered[filtered.id==x].iloc[0].author}"
+                            if "author" in filtered.columns and str(filtered[filtered.id==x].iloc[0].author or "").strip()
+                            else ""
+                        )
+                    ),
+                    key="saved_book_select_v32"
                 )
+                row=filtered[filtered.id==bid].iloc[0]
+                saved_fp=str(row.fp_level or "").strip().upper() if "fp_level" in filtered.columns else ""
 
-                q=st.text_input(
-                    "Book title, author, keywords, or ISBN",
-                    placeholder="Example: Charlotte's Web or 9780064400558",
-                    key="book_online_query"
-                )
+                st.write(f"**Title:** {row.title}")
+                if "author" in filtered.columns and str(row.author or "").strip():
+                    st.write(f"**Author:** {row.author}")
+                if "isbn" in filtered.columns and str(row.isbn or "").strip():
+                    st.write(f"**ISBN:** {row.isbn}")
+                st.write(f"**Verified F&P:** {saved_fp or 'Not saved'}")
 
-                if st.button("Search Internet",key="book_search_internet"):
-                    try:
-                        if search_mode=="ISBN":
-                            result=openlibrary_lookup_isbn(q)
-                            st.session_state["book_online_results"]=[result] if result else []
+                if saved_fp and current_fp:
+                    relation=fp_level_relation(current_fp,saved_fp)
+                    if relation:
+                        label,diff=relation
+                        if diff==0:
+                            st.success(f"On {scholar_name}'s current F&P level.")
+                        elif diff<0:
+                            st.info(f"{label}: book {saved_fp}, scholar {current_fp}.")
                         else:
-                            st.session_state["book_online_results"]=openlibrary_search_books(q,limit=10)
-                        if not st.session_state["book_online_results"]:
-                            st.warning("No matching books were found.")
-                    except Exception as e:
-                        st.error(str(e))
+                            st.warning(f"{label}: book {saved_fp}, scholar {current_fp}.")
+                elif not saved_fp:
+                    st.info("Add a verified F&P level to compare this book automatically.")
 
-                online_results=st.session_state.get("book_online_results",[])
-                if online_results:
-                    labels=[]
-                    for i,b in enumerate(online_results):
-                        title=b.get("title") or "Untitled"
-                        author=b.get("author") or "Unknown author"
-                        year=b.get("year") or b.get("publish_date") or ""
-                        isbn=b.get("isbn") or ""
-                        label=f"{title} — {author}"
-                        if year:
-                            label+=f" ({year})"
-                        if isbn:
-                            label+=f" | ISBN {isbn}"
-                        labels.append(label)
-
-                    idx=st.selectbox(
-                        "Select a result",
-                        list(range(len(online_results))),
-                        format_func=lambda x:labels[x],
-                        key="book_online_result_select"
+                st.markdown("#### Edit Saved Book")
+                with st.form("edit_saved_book_v32"):
+                    etitle=st.text_input("Title",value=str(row.title or ""))
+                    eauthor=st.text_input(
+                        "Author",
+                        value=str(row.author or "") if "author" in filtered.columns else ""
                     )
-                    book=online_results[idx]
-
-                    cover_url=book.get("cover_url") or openlibrary_cover_url(book)
-                    c1,c2=st.columns([1,2])
-                    with c1:
-                        if cover_url:
-                            st.image(cover_url,width=180)
-                        else:
-                            st.caption("No cover image available.")
-                    with c2:
-                        st.markdown(f"**Title:** {book.get('title') or 'Untitled'}")
-                        st.write(f"**Author:** {book.get('author') or 'Unknown'}")
-                        if book.get("publisher"):
-                            st.write(f"**Publisher:** {book.get('publisher')}")
-                        if book.get("year") or book.get("publish_date"):
-                            st.write(f"**Published:** {book.get('year') or book.get('publish_date')}")
-                        if book.get("isbn"):
-                            st.write(f"**ISBN:** {book.get('isbn')}")
-
-                    st.info(
-                        "Open Library does not reliably provide Fountas & Pinnell levels. "
-                        "ChapLab will not guess an F&P level. Enter a verified level if you know it, "
-                        "then save the book so future checks are automatic."
+                    eisbn=st.text_input(
+                        "ISBN",
+                        value=str(row.isbn or "") if "isbn" in filtered.columns else ""
                     )
-
-                    verified_fp=st.text_input(
-                        "Verified F&P level (optional)",
-                        placeholder="Example: M",
-                        key="book_verified_fp_online"
-                    ).strip().upper()
-
-                    notes=st.text_area(
-                        "Book notes",
-                        placeholder="Optional notes about this edition, classroom use, or source of the verified level.",
-                        height=80,
-                        key="book_online_notes"
+                    efp=st.text_input("Verified F&P",value=saved_fp)
+                    enotes=st.text_area(
+                        "Notes",
+                        value=str(row.notes or "") if "notes" in filtered.columns else ""
                     )
-
-                    if verified_fp and not re.fullmatch(r"[A-Z]",verified_fp):
-                        st.warning("For automatic comparison, use a single F&P letter level A–Z.")
-
-                    if verified_fp and current_fp:
-                        relation=fp_level_relation(current_fp,verified_fp)
-                        if relation:
-                            label,diff=relation
-                            if diff==0:
-                                st.success(f"This book is **on {scholar_name}'s current F&P level ({current_fp})**.")
-                            elif diff<0:
-                                st.info(
-                                    f"This book is **{label.lower()}** for {scholar_name}: "
-                                    f"book {verified_fp}, scholar {current_fp}."
-                                )
-                            else:
-                                st.warning(
-                                    f"This book is **{label.lower()}** for {scholar_name}: "
-                                    f"book {verified_fp}, scholar {current_fp}."
-                                )
-
-                    if st.button("Save to My Book Catalog",key="save_online_book"):
+                    if st.form_submit_button("Save Book Changes"):
                         c=conn()
-                        # Inspect catalog columns dynamically so this remains compatible
-                        # with earlier ChapLab database versions.
                         cols=[r["name"] for r in c.execute("PRAGMA table_info(book_catalog)").fetchall()]
-                        title=(book.get("title") or "Untitled").strip()
-                        author=(book.get("author") or "").strip()
-                        isbn=(book.get("isbn") or "").strip()
-
-                        existing=None
-                        if isbn and "isbn" in cols:
-                            existing=c.execute(
-                                "SELECT id FROM book_catalog WHERE isbn=? LIMIT 1",
-                                (isbn,)
-                            ).fetchone()
-                        if not existing:
-                            existing=c.execute(
-                                "SELECT id FROM book_catalog WHERE lower(title)=lower(?) AND lower(COALESCE(author,''))=lower(?) LIMIT 1",
-                                (title,author)
-                            ).fetchone()
-
-                        if existing:
-                            sets=[]
-                            vals=[]
-                            if "fp_level" in cols:
-                                sets.append("fp_level=?"); vals.append(verified_fp)
-                            if "isbn" in cols:
-                                sets.append("isbn=?"); vals.append(isbn)
-                            if "notes" in cols:
-                                sets.append("notes=?"); vals.append(notes.strip())
-                            if sets:
-                                vals.append(int(existing["id"]))
-                                c.execute(f"UPDATE book_catalog SET {','.join(sets)} WHERE id=?",vals)
-                            st.success("Book already existed; saved information was updated.")
-                        else:
-                            insert_cols=["title"]
-                            insert_vals=[title]
-                            if "author" in cols:
-                                insert_cols.append("author"); insert_vals.append(author)
-                            if "fp_level" in cols:
-                                insert_cols.append("fp_level"); insert_vals.append(verified_fp)
-                            if "isbn" in cols:
-                                insert_cols.append("isbn"); insert_vals.append(isbn)
-                            if "notes" in cols:
-                                insert_cols.append("notes"); insert_vals.append(notes.strip())
-                            placeholders=",".join(["?"]*len(insert_cols))
-                            c.execute(
-                                f"INSERT INTO book_catalog({','.join(insert_cols)}) VALUES ({placeholders})",
-                                insert_vals
-                            )
-                            st.success("Book saved to your ChapLab catalog.")
+                        sets=["title=?"]; vals=[etitle.strip()]
+                        if "author" in cols:
+                            sets.append("author=?"); vals.append(eauthor.strip())
+                        if "isbn" in cols:
+                            sets.append("isbn=?"); vals.append(eisbn.strip())
+                        if "fp_level" in cols:
+                            sets.append("fp_level=?"); vals.append(efp.strip().upper())
+                        if "notes" in cols:
+                            sets.append("notes=?"); vals.append(enotes.strip())
+                        vals.append(int(bid))
+                        c.execute(f"UPDATE book_catalog SET {','.join(sets)} WHERE id=?",vals)
                         c.commit(); c.close()
+                        st.success("Saved book updated.")
                         st.rerun()
 
-            with tabs[1]:
-                st.markdown("### My Book Catalog")
-                c=conn()
-                catalog=pd.read_sql_query("SELECT * FROM book_catalog ORDER BY title",c)
-                c.close()
-
-                if catalog.empty:
-                    st.caption("Your book catalog is empty. Use Search Internet to add books.")
-                else:
-                    search_local=st.text_input(
-                        "Search saved books",
-                        placeholder="Type title or author",
-                        key="book_catalog_search_v32"
-                    )
-                    filtered=catalog.copy()
-                    if search_local.strip():
-                        mask=filtered["title"].astype(str).str.contains(search_local,case=False,na=False)
-                        if "author" in filtered.columns:
-                            mask=mask | filtered["author"].astype(str).str.contains(search_local,case=False,na=False)
-                        filtered=filtered[mask]
-
-                    if filtered.empty:
-                        st.warning("No saved books match that search.")
-                    else:
-                        bid=st.selectbox(
-                            "Saved book",
-                            list(filtered.id.astype(int)),
-                            format_func=lambda x:(
-                                f"{filtered[filtered.id==x].iloc[0].title}"
-                                + (
-                                    f" — {filtered[filtered.id==x].iloc[0].author}"
-                                    if "author" in filtered.columns and str(filtered[filtered.id==x].iloc[0].author or "").strip()
-                                    else ""
-                                )
-                            ),
-                            key="saved_book_select_v32"
-                        )
-                        row=filtered[filtered.id==bid].iloc[0]
-                        saved_fp=str(row.fp_level or "").strip().upper() if "fp_level" in filtered.columns else ""
-
-                        st.write(f"**Title:** {row.title}")
-                        if "author" in filtered.columns and str(row.author or "").strip():
-                            st.write(f"**Author:** {row.author}")
-                        if "isbn" in filtered.columns and str(row.isbn or "").strip():
-                            st.write(f"**ISBN:** {row.isbn}")
-                        st.write(f"**Verified F&P:** {saved_fp or 'Not saved'}")
-
-                        if saved_fp and current_fp:
-                            relation=fp_level_relation(current_fp,saved_fp)
-                            if relation:
-                                label,diff=relation
-                                if diff==0:
-                                    st.success(f"On {scholar_name}'s current F&P level.")
-                                elif diff<0:
-                                    st.info(f"{label}: book {saved_fp}, scholar {current_fp}.")
-                                else:
-                                    st.warning(f"{label}: book {saved_fp}, scholar {current_fp}.")
-                        elif not saved_fp:
-                            st.info("Add a verified F&P level to compare this book automatically.")
-
-                        st.markdown("#### Edit Saved Book")
-                        with st.form("edit_saved_book_v32"):
-                            etitle=st.text_input("Title",value=str(row.title or ""))
-                            eauthor=st.text_input(
-                                "Author",
-                                value=str(row.author or "") if "author" in filtered.columns else ""
-                            )
-                            eisbn=st.text_input(
-                                "ISBN",
-                                value=str(row.isbn or "") if "isbn" in filtered.columns else ""
-                            )
-                            efp=st.text_input("Verified F&P",value=saved_fp)
-                            enotes=st.text_area(
-                                "Notes",
-                                value=str(row.notes or "") if "notes" in filtered.columns else ""
-                            )
-                            if st.form_submit_button("Save Book Changes"):
-                                c=conn()
-                                cols=[r["name"] for r in c.execute("PRAGMA table_info(book_catalog)").fetchall()]
-                                sets=["title=?"]; vals=[etitle.strip()]
-                                if "author" in cols:
-                                    sets.append("author=?"); vals.append(eauthor.strip())
-                                if "isbn" in cols:
-                                    sets.append("isbn=?"); vals.append(eisbn.strip())
-                                if "fp_level" in cols:
-                                    sets.append("fp_level=?"); vals.append(efp.strip().upper())
-                                if "notes" in cols:
-                                    sets.append("notes=?"); vals.append(enotes.strip())
-                                vals.append(int(bid))
-                                c.execute(f"UPDATE book_catalog SET {','.join(sets)} WHERE id=?",vals)
-                                c.commit(); c.close()
-                                st.success("Saved book updated.")
-                                st.rerun()
-
-                        confirm=st.checkbox("Delete this saved book",key="delete_saved_book_confirm_v32")
-                        if st.button("Delete Book",disabled=not confirm,key="delete_saved_book_v32"):
-                            c=conn()
-                            c.execute("DELETE FROM book_catalog WHERE id=?",(int(bid),))
-                            c.commit(); c.close()
-                            st.success("Book deleted from catalog.")
-                            st.rerun()
-
+                confirm=st.checkbox("Delete this saved book",key="delete_saved_book_confirm_v32")
+                if st.button("Delete Book",disabled=not confirm,key="delete_saved_book_v32"):
+                    c=conn()
+                    c.execute("DELETE FROM book_catalog WHERE id=?",(int(bid),))
+                    c.commit(); c.close()
+                    st.success("Book deleted from catalog.")
+                    st.rerun()
 
 
 elif page=="Student Grouping":
@@ -3831,7 +3826,58 @@ elif page=="Report Card Comments":
     academic_year=current_academic_year()
 
     if roster.empty:
-        st.info("Select a class with scholars first.")
+        st.info("No scholars yet. The Report Card Comment workspace is ready below and will populate with scholar data automatically once you add a roster.")
+
+        r0,r1,r2=st.columns(3)
+        r0.text_input("Find scholar",placeholder="Scholar names will appear here",disabled=True,key="rc_preview_find")
+        r1.selectbox("Subject",["ELA","Math","Science","Social Studies"],key="rc_preview_subject")
+        r2.selectbox("Marking Period",["Quarter 1","Quarter 2","Quarter 3","Quarter 4"],key="rc_preview_mp")
+
+        st.markdown("### Quarter Grade Evidence")
+        st.dataframe(
+            pd.DataFrame(columns=["Assignment Date","Assignment","Category","Standard","Grade"]),
+            hide_index=True,use_container_width=True
+        )
+        st.caption("Quarter averages, assignment evidence, growth, and missing-grade checks will populate here.")
+
+        st.markdown("### Upcoming Skills")
+        preview_subj=st.session_state.get("rc_preview_subject","ELA")
+        preview_skills=[r.skill for _,r in standards_df(preview_subj).iterrows()]
+        st.multiselect("Upcoming skills to include",preview_skills,key="rc_preview_next_skills")
+
+        st.markdown("### Comment Controls")
+        c1,c2=st.columns(2)
+        c1.selectbox("Comment Length",["Short","Standard","Detailed"],index=1,key="rc_preview_length")
+        c2.number_input("Maximum Characters",min_value=100,max_value=5000,value=1000,step=50,key="rc_preview_chars")
+
+        ck1,ck2=st.columns(2)
+        with ck1:
+            st.checkbox("Include overall quarter grade",value=True,key="rc_preview_overall")
+            st.checkbox("Include quarter-to-quarter growth",value=True,key="rc_preview_growth")
+            st.checkbox("Include strongest skill",value=True,key="rc_preview_strength")
+            st.checkbox("Include area for improvement",value=True,key="rc_preview_need")
+        with ck2:
+            st.checkbox("Include assignment examples",value=True,key="rc_preview_assign")
+            st.checkbox("Include how family can help",value=True,key="rc_preview_home")
+            st.checkbox("Include what teacher will do",value=True,key="rc_preview_teacher")
+            st.checkbox("Include upcoming skills",value=True,key="rc_preview_upcoming")
+
+        st.button("Generate Quarter-Based Comment",disabled=True,key="rc_preview_generate")
+        st.text_area(
+            "Edit / finalize / copy",
+            value="Generated scholar-specific comment will appear here.",
+            height=220,disabled=True,key="rc_preview_text"
+        )
+        st.button("Save Final Comment",disabled=True,key="rc_preview_save")
+
+        st.markdown("---")
+        st.markdown("## Quarter Closeout")
+        q1,q2,q3,q4=st.columns(4)
+        q1.checkbox("Grades complete/reviewed",disabled=True,key="rc_preview_close1")
+        q2.checkbox("Data reviewed",disabled=True,key="rc_preview_close2")
+        q3.checkbox("Comment generated",disabled=True,key="rc_preview_close3")
+        q4.checkbox("Comment finalized",disabled=True,key="rc_preview_close4")
+        st.caption("Closeout status will become scholar-specific once a roster exists.")
     else:
         q=st.text_input("Find scholar",placeholder="Type first or last name",key="rc_find_scholar")
         filtered=roster
@@ -3990,7 +4036,54 @@ elif page=="Little Assistant":
 
     roster=scholars_df(selected_class or None)
     if roster.empty:
-        st.info("Select a class with scholars first.")
+        st.info("No scholars yet. You can still see the complete Little Assistant workspace; scholar information will prefill these tools automatically after a roster is added.")
+
+        if tool=="IEP / Student Support":
+            st.markdown("### Profile & Data Prefill")
+            st.text_area("Existing scholar data",value="Scholar profile, assessment data, grades, work samples, and saved support notes will prefill here.",height=150,disabled=True,key="la_preview_prefill")
+            p1,p2=st.columns(2)
+            p1.selectbox("Documentation type",["Academic","Reading","Writing","Math","Attention / task completion","Behavior / self-management","Communication","Social interaction","Intervention response","Other"],key="la_preview_note_type")
+            p2.selectbox("Area of concern",["Academic performance","Reading fluency","Reading comprehension","Written expression","Math computation","Attention / focus","Task completion","Behavior / self-management","Other / Custom"],key="la_preview_concern")
+            st.text_area("Objective observation",placeholder="Describe only what you observed.",key="la_preview_observation")
+            p3,p4=st.columns(2)
+            p3.selectbox("Frequency / pattern",["Rarely","1–2 times per week","3–4 times per week","Daily","Multiple times per day","Across settings"],key="la_preview_frequency")
+            p4.selectbox("Primary support/intervention tried",["Small-group reteach","1:1 teacher conference","Repeated directions","Visual reminder / checklist","Extended time","Frequent check-ins","Other / Custom"],key="la_preview_intervention")
+            st.text_area("Additional intervention details",key="la_preview_intervention_details")
+            p5,p6=st.columns(2)
+            p5.selectbox("Response to support",["Improved with support","Some improvement","Improvement was temporary","No noticeable improvement yet","Performance remained inconsistent"],key="la_preview_response")
+            p6.selectbox("Educational impact",["Reduces accuracy","Slows work completion","Makes independent work difficult","Affects participation","Affects comprehension","Affects written output"],key="la_preview_impact")
+            st.button("Save Evidence Note",disabled=True,key="la_preview_save_evidence")
+            st.button("Generate Teacher Support Summary",disabled=True,key="la_preview_support_summary")
+            st.text_area("Editable teacher support summary",height=180,disabled=True,key="la_preview_support_text")
+
+        elif tool=="IAT Referral":
+            st.markdown("### IAT Referral Writer")
+            st.caption("The referral will combine academic data, intervention evidence, work samples, and family contact history.")
+            st.text_area("Primary concern / reason for referral",height=100,key="la_preview_iat_concern")
+            st.text_area("Strategies and interventions already tried",height=100,key="la_preview_iat_interventions")
+            st.text_area("Response to interventions",height=100,key="la_preview_iat_response")
+            st.button("Generate IAT Referral",disabled=True,key="la_preview_iat_generate")
+            st.text_area("Editable IAT referral",height=220,disabled=True,key="la_preview_iat_text")
+
+        elif tool=="Parent Message":
+            st.markdown("### Parent Message")
+            p1,p2=st.columns(2)
+            p1.selectbox("Message type",["Positive update","Academic concern","Behavior concern","Missing work","Progress update","Reminder","Other"],key="la_preview_parent_type")
+            p2.selectbox("Subject",["General","ELA","Math","Science","Social Studies","Behavior"],key="la_preview_parent_subject")
+            st.text_area("What happened / what should the family know?",height=110,key="la_preview_parent_details")
+            st.text_area("Next step / request",height=90,key="la_preview_parent_next")
+            st.button("Generate Parent Message",disabled=True,key="la_preview_parent_generate")
+            st.text_area("Editable parent message",height=180,disabled=True,key="la_preview_parent_text")
+
+        elif tool=="Phone Call Script":
+            st.markdown("### Phone Call Script")
+            p1,p2=st.columns(2)
+            p1.selectbox("Reason for call",["Positive update","Academic concern","Behavior concern","Missing work","Progress update","Follow-up","Other"],key="la_preview_call_reason")
+            p2.selectbox("Subject",["General","ELA","Math","Science","Social Studies","Behavior"],key="la_preview_call_subject")
+            st.text_area("Key details to discuss",height=110,key="la_preview_call_details")
+            st.text_area("Desired next steps",height=90,key="la_preview_call_next")
+            st.button("Generate Phone Call Script",disabled=True,key="la_preview_call_generate")
+            st.text_area("Editable phone call script",height=180,disabled=True,key="la_preview_call_text")
     else:
         sid=st.selectbox("Scholar",list(roster.id.astype(int)),
                          format_func=lambda x:nm(roster[roster.id==x].iloc[0]),
@@ -4596,7 +4689,26 @@ elif page=="Communication Log":
 
     st.markdown("### Add communication record")
     if roster.empty:
-        st.info("No scholars in this class folder.")
+        st.info("No scholars yet. The communication form is ready below and the Scholar/Parent fields will populate automatically after you add a roster.")
+
+        pc1,pc2=st.columns(2)
+        pc1.selectbox("Scholar",["Scholar names will appear here"],disabled=True,key="comm_preview_scholar")
+        pc2.selectbox("Parent / Guardian",["Parent/guardian contacts will appear here"],disabled=True,key="comm_preview_guardian")
+
+        comm_type=st.selectbox("Communication Type",[
+            "Phone Call","Voicemail","Text / School Message","Email",
+            "In-Person Conversation","Conference","Letter / Notice Sent","Other"
+        ],key="comm_preview_type")
+        date_text=st.text_input("Date",value=date.today().strftime("%m/%d/%Y"),placeholder="MM/DD/YYYY",key="comm_preview_date")
+        subject=st.selectbox("Subject",["General","ELA","Math","Science","Social Studies","Behavior","Attendance","Health / Injury"],key="comm_preview_subject")
+        reason=st.selectbox("Reason",[
+            "Positive update","Homework reminder","Missing assignment","Academic concern",
+            "Behavior concern","Attendance / lateness","Injury / classroom incident",
+            "Conference request","Progress update","Assessment / test","Supplies / materials",
+            "Follow-up from previous contact","Parent question / concern","Other"
+        ],key="comm_preview_reason")
+        st.text_area("Notes / More Information",placeholder="Add what happened, what was discussed, parent response, next steps, etc.",key="comm_preview_notes")
+        st.button("Save Communication Record",disabled=True,key="comm_preview_save")
     else:
         scholar_id=st.selectbox(
             "Scholar",
@@ -4651,7 +4763,7 @@ elif page=="Communication Log":
     d=pd.read_sql_query(q,c,params=params); c.close()
 
     if d.empty:
-        st.caption("No communication records yet.")
+        st.caption("No communication records yet. Saved records will appear here automatically.")
     else:
         show=d.copy()
         show["Parent / Guardian"]=show.apply(
