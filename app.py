@@ -1105,6 +1105,29 @@ def save_teacher_name(name):
     c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES ('teacher_name',?)",(json.dumps(name.strip()),))
     c.commit(); c.close()
 
+def teacher_dashboard_info():
+    c=conn()
+    out={"homeroom":"","subjects":[]}
+    for key in ["teacher_homeroom","teacher_subjects"]:
+        r=c.execute("SELECT value FROM settings WHERE key=?",(key,)).fetchone()
+        if r:
+            try:
+                val=json.loads(r["value"])
+            except:
+                val=r["value"]
+            if key=="teacher_homeroom":
+                out["homeroom"]=str(val or "")
+            else:
+                out["subjects"]=val if isinstance(val,list) else []
+    c.close()
+    return out
+
+def save_teacher_dashboard_info(homeroom, subjects):
+    c=conn()
+    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES ('teacher_homeroom',?)",(json.dumps(str(homeroom or "").strip()),))
+    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES ('teacher_subjects',?)",(json.dumps(list(subjects or [])),))
+    c.commit(); c.close()
+
 def class_assignments_df(class_id, subject_filter="All Subjects", sort_order="Oldest → Newest"):
     c=conn()
     q="SELECT * FROM assignments WHERE 1=1"
@@ -2239,6 +2262,25 @@ if page=="Home Page":
     if hasattr(st,"html"): st.html(hero)
     else: st.markdown(hero,unsafe_allow_html=True)
 
+    teacher_info=teacher_dashboard_info()
+    with st.expander("👩🏽‍🏫 My Teacher Info",expanded=False):
+        ti1,ti2=st.columns([1,2])
+        dash_homeroom=ti1.text_input(
+            "Homeroom",
+            value=teacher_info.get("homeroom",""),
+            placeholder="Example: 3-208",
+            key="dashboard_teacher_homeroom"
+        )
+        dash_subjects=ti2.multiselect(
+            "My Subjects",
+            ["ELA","Math","Science","Social Studies","Grammar","Writing"],
+            default=[s for s in teacher_info.get("subjects",[]) if s in ["ELA","Math","Science","Social Studies","Grammar","Writing"]],
+            key="dashboard_teacher_subjects"
+        )
+        if st.button("Save My Teacher Info",key="save_dashboard_teacher_info"):
+            save_teacher_dashboard_info(dash_homeroom,dash_subjects)
+            st.success("Teacher information saved.")
+
     posts=[]
     colors=["s-pink","s-orange","s-yellow"]
     for i,info in enumerate(class_summaries[:3]):
@@ -3210,6 +3252,46 @@ elif page=="Book Leveler":
 
             with tabs[0]:
                 st.markdown("### Search Open Library")
+
+                # Camera is intentionally user-activated. It is NOT rendered
+                # until the teacher clicks the button below.
+                if st.button("📷 Scan ISBN with Camera",key="toggle_book_camera"):
+                    st.session_state["show_book_camera"]=not st.session_state.get("show_book_camera",False)
+                    st.rerun()
+
+                if st.session_state.get("show_book_camera",False):
+                    with st.container(border=True):
+                        cam_top1,cam_top2=st.columns([5,1])
+                        cam_top1.markdown("#### 📷 ISBN Camera")
+                        if cam_top2.button("✕ Close",key="close_book_camera"):
+                            st.session_state["show_book_camera"]=False
+                            st.rerun()
+                        st.caption("Point the camera at the ISBN barcode. The camera stays off unless you open it.")
+                        camera_photo=st.camera_input(
+                            "Capture the ISBN barcode",
+                            key="book_isbn_camera_capture"
+                        )
+                        if camera_photo is not None:
+                            st.success("Barcode photo captured.")
+                            st.caption("Type the ISBN printed above the barcode below to search for the book.")
+                            captured_isbn=st.text_input(
+                                "ISBN from captured book",
+                                placeholder="978...",
+                                key="book_camera_isbn"
+                            )
+                            cleaned_camera_isbn=re.sub(r"[^0-9Xx]","",captured_isbn or "")
+                            if st.button("Find Captured Book",key="find_camera_book"):
+                                if len(cleaned_camera_isbn) not in (10,13):
+                                    st.warning("Enter a valid 10- or 13-digit ISBN.")
+                                else:
+                                    try:
+                                        found=openlibrary_lookup_isbn(cleaned_camera_isbn)
+                                        st.session_state["book_online_results"]=[found] if found else []
+                                        if not found:
+                                            st.warning("No matching book was found.")
+                                    except Exception as e:
+                                        st.error(str(e))
+
                 search_mode=st.radio(
                     "Search by",
                     ["Title / Author / Keyword","ISBN"],
