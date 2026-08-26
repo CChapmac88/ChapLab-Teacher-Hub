@@ -95,6 +95,8 @@ def require_login():
         return
 
     if st.session_state.get("chaplab_authenticated"):
+        if not st.session_state.get("chaplab_username") and auth:
+            st.session_state["chaplab_username"]=auth.get("username","teacher")
         return
 
     st.markdown("## 📘 ChapLab Teacher Hub")
@@ -106,6 +108,7 @@ def require_login():
     if submitted:
         if username==auth["username"] and password==auth["password"]:
             st.session_state["chaplab_authenticated"]=True
+            st.session_state["chaplab_username"]=username
             st.rerun()
         else:
             st.error("Username or password is incorrect.")
@@ -501,6 +504,41 @@ def init_db():
         assignment_id INTEGER
     );
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);
+    CREATE TABLE IF NOT EXISTS newsletter_blurbs(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        author_key TEXT NOT NULL,
+        author_name TEXT DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        academic_year TEXT DEFAULT '',
+        newsletter_period TEXT DEFAULT '',
+        blurb_type TEXT DEFAULT 'Subject',
+        subject TEXT DEFAULT '',
+        title TEXT DEFAULT '',
+        recently_taught TEXT DEFAULT '',
+        family_help TEXT DEFAULT '',
+        coming_next TEXT DEFAULT '',
+        prepare_next TEXT DEFAULT '',
+        event_type TEXT DEFAULT '',
+        event_details TEXT DEFAULT '',
+        generated_blurb TEXT DEFAULT '',
+        status TEXT DEFAULT 'Draft',
+        submitted_at TEXT DEFAULT '',
+        finalized_at TEXT DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS newsletter_blurb_versions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        blurb_id INTEGER,
+        author_key TEXT NOT NULL,
+        author_name TEXT DEFAULT '',
+        saved_at TEXT NOT NULL,
+        action TEXT DEFAULT 'Saved',
+        content_snapshot TEXT DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS newsletter_roles(
+        author_key TEXT PRIMARY KEY,
+        is_newsletter_lead INTEGER DEFAULT 0
+    );
     CREATE TABLE IF NOT EXISTS communications(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         scholar_id INTEGER, guardian_id INTEGER,
@@ -2950,6 +2988,79 @@ def render_iready_center(class_id=None):
 
     render_assessment_insights(iready_scope_dataframe(class_id,subject),subject,"I‑Ready")
 
+
+# ---------- Newsletter Hub ----------
+def current_author_key():
+    return str(st.session_state.get("chaplab_username") or (auth_config() or {}).get("username") or "local_teacher").strip().lower()
+
+def current_author_name():
+    return teacher_dashboard_info().get("display_name") or get_teacher_name() or "Teacher"
+
+def newsletter_is_lead(author_key=None):
+    author_key=author_key or current_author_key()
+    c=conn()
+    r=c.execute("SELECT is_newsletter_lead FROM newsletter_roles WHERE author_key=?",(author_key,)).fetchone()
+    c.close()
+    return bool(r["is_newsletter_lead"]) if r else False
+
+def set_newsletter_lead(value, author_key=None):
+    author_key=author_key or current_author_key()
+    c=conn()
+    c.execute("""INSERT INTO newsletter_roles(author_key,is_newsletter_lead) VALUES (?,?)
+                 ON CONFLICT(author_key) DO UPDATE SET is_newsletter_lead=excluded.is_newsletter_lead""",
+              (author_key,1 if value else 0))
+    c.commit(); c.close()
+
+def save_newsletter_version(blurb_id, action, snapshot, author_key=None, author_name=None):
+    c=conn()
+    c.execute("""INSERT INTO newsletter_blurb_versions(
+        blurb_id,author_key,author_name,saved_at,action,content_snapshot)
+        VALUES (?,?,?,?,?,?)""",
+        (blurb_id,author_key or current_author_key(),author_name or current_author_name(),
+         datetime.now().isoformat(timespec="minutes"),action,snapshot))
+    c.commit(); c.close()
+
+def newsletter_rows(period=None):
+    c=conn()
+    q="SELECT * FROM newsletter_blurbs WHERE 1=1"
+    p=[]
+    if period:
+        q+=" AND newsletter_period=?"
+        p.append(period)
+    q+=" ORDER BY updated_at DESC,id DESC"
+    df=pd.read_sql_query(q,c,params=p)
+    c.close()
+    return df
+
+def generate_subject_newsletter_blurb(subject,recent,family,next_up,prepare):
+    pieces=[]
+    if recent.strip():
+        pieces.append(f"In {subject}, scholars have recently been learning about {recent.strip().rstrip('.')}.")
+    if family.strip():
+        pieces.append(f"At home, families can help strengthen these skills by {family.strip().rstrip('.')}.")
+    if next_up.strip():
+        pieces.append(f"Coming up next, scholars will begin {next_up.strip().rstrip('.')}.")
+    if prepare.strip():
+        pieces.append(f"To help your scholar prepare, {prepare.strip().rstrip('.')}.")
+    return " ".join(pieces)
+
+def generate_event_newsletter_blurb(event_type,event_details):
+    et=str(event_type or "Upcoming Event").strip()
+    details=str(event_details or "").strip()
+    return f"Upcoming reminder — {et}: {details}" if details else f"Upcoming reminder: {et}."
+
+def assistant_scholar_context(roster,key_prefix):
+    sid=st.selectbox(
+        "Scholar",
+        list(roster.id.astype(int)),
+        format_func=lambda x:nm(roster[roster.id==x].iloc[0]),
+        key=f"{key_prefix}_scholar"
+    )
+    scholar=roster[roster.id==sid].iloc[0]
+    name=nm(scholar)
+    pro=scholar_pronouns(sid)
+    return sid,scholar,name,pro,pro["subject"],pro["possessive"]
+
 # ---------- App Shell ----------
 cdf=classes_df()
 folder={0:"All Classes", **{int(r.id):r.class_name for _,r in cdf.iterrows()}}
@@ -3124,6 +3235,19 @@ with st.container(border=True):
             st.session_state["show_teacher_profile_settings"]=False
             st.rerun()
 
+        st.markdown("---")
+        st.markdown("#### Newsletter Role")
+        current_lead=newsletter_is_lead()
+        lead_choice=st.checkbox(
+            "Newsletter Lead — can edit/finalize all submitted blurbs",
+            value=current_lead,
+            key="prof_newsletter_lead"
+        )
+        if st.button("Save Newsletter Role",key="prof_save_newsletter_role"):
+            set_newsletter_lead(lead_choice)
+            st.success("Newsletter role saved.")
+            st.rerun()
+
 _nav=[("🏠 Dashboard","Home Page"),("🎓 Scholars","Scholars"),("Ⓐ Grades","Scholar Binder"),("📚 Book Leveler","Book Leveler"),("👥 Student Grouping","Student Grouping"),("📝 Report Comments","Report Card Comments"),("✨ Little Assistant","Little Assistant"),("📌 Bulletin Board","Bulletin Board"),("💬 Communication","Communication Log"),("⚙️ Web & Backup","Web & Backup")]
 cols=st.columns(10)
 for col,(label,target) in zip(cols,_nav):
@@ -3214,6 +3338,208 @@ if page=="Home Page":
             st.caption("No saved reminders or report-card deadlines.")
         else:
             st.dataframe(pd.DataFrame(anns,columns=["Type","Reminder","Due"]),hide_index=True,use_container_width=True)
+
+
+    st.markdown("---")
+    st.markdown('<div class="page-title">📰 Newsletter Hub</div>',unsafe_allow_html=True)
+    st.caption(
+        "Create family-friendly subject blurbs, submit them to the newsletter lead, "
+        "and keep a dated history of every saved version."
+    )
+
+    author_key=current_author_key()
+    author_name=current_author_name()
+    is_lead=newsletter_is_lead(author_key)
+    teacher_subjects=teacher_dashboard_info().get("subjects",[]) or ["ELA","Math","Science","Social Studies"]
+    ay=current_academic_year()
+
+    n1,n2=st.columns([2,1])
+    newsletter_period=n1.text_input(
+        "Newsletter issue / week",
+        value=st.session_state.get("newsletter_period",""),
+        placeholder="Example: Week of September 14",
+        key="newsletter_period_input"
+    )
+    st.session_state["newsletter_period"]=newsletter_period
+    n2.info("Newsletter Lead" if is_lead else "Teacher Contributor")
+
+    tab_names=["✍️ Create My Blurb","📬 Submitted Blurbs","🧾 My Archive"]
+    if is_lead:
+        tab_names.append("🗞️ Newsletter Lead")
+    tabs=st.tabs(tab_names)
+
+    with tabs[0]:
+        blurb_type=st.radio("Blurb type",["Subject Update","School / Upcoming Event"],horizontal=True,key="newsletter_blurb_type")
+
+        if blurb_type=="Subject Update":
+            subject=st.selectbox(
+                "Subject",
+                list(dict.fromkeys(teacher_subjects+["ELA","Math","Science","Social Studies","Other / Custom"])),
+                key="newsletter_subject"
+            )
+            subject_custom=st.text_input("Other / custom subject",key="newsletter_subject_custom")
+            subject_final=subject_custom.strip() if subject=="Other / Custom" and subject_custom.strip() else subject
+            title=st.text_input("Optional blurb title",placeholder=f"{subject_final} Update",key="newsletter_title")
+            recent=st.text_area("What have scholars recently learned?",height=90,key="newsletter_recent")
+            family=st.text_area("How can families help scholars improve/practice these skills?",height=90,key="newsletter_family")
+            next_up=st.text_area("What's coming up next?",height=80,key="newsletter_next")
+            prepare=st.text_area("How can families help their child prepare?",height=80,key="newsletter_prepare")
+            if st.button("✨ Generate Subject Blurb",key="newsletter_generate_subject"):
+                st.session_state["newsletter_generated"]=generate_subject_newsletter_blurb(subject_final,recent,family,next_up,prepare)
+            event_type=""
+            event_details=""
+            record_type="Subject"
+        else:
+            subject_final=""
+            title=st.text_input("Optional event heading",placeholder="Upcoming Dates & Reminders",key="newsletter_event_title")
+            event_choice=st.selectbox(
+                "Event / announcement type",
+                ["Dress-Down Day","Field Trip","School Event","Assessment / Testing",
+                 "Half Day / Schedule Change","Family Event","Deadline / Form Due",
+                 "School Closure","Fundraiser","Other / Custom"],
+                key="newsletter_event_type"
+            )
+            event_custom=st.text_input("Other / custom event type",key="newsletter_event_type_other")
+            event_type=event_custom.strip() if event_choice=="Other / Custom" and event_custom.strip() else event_choice
+            event_details=st.text_area(
+                "Event details",
+                placeholder="Include date, time, clothing/items needed, permission slip deadline, cost, location, or anything families should know.",
+                height=135,key="newsletter_event_details"
+            )
+            if st.button("✨ Generate Event Blurb",key="newsletter_generate_event"):
+                st.session_state["newsletter_generated"]=generate_event_newsletter_blurb(event_type,event_details)
+            recent=family=next_up=prepare=""
+            record_type="Event"
+
+        generated=st.text_area(
+            "Edit / finalize your blurb",
+            value=st.session_state.get("newsletter_generated",""),
+            height=180,key="newsletter_generated_editor"
+        )
+        save1,save2=st.columns(2)
+        if save1.button("💾 Save Draft",key="newsletter_save_draft",use_container_width=True):
+            now=datetime.now().isoformat(timespec="minutes")
+            c=conn()
+            cur=c.execute("""INSERT INTO newsletter_blurbs(
+                author_key,author_name,created_at,updated_at,academic_year,newsletter_period,
+                blurb_type,subject,title,recently_taught,family_help,coming_next,prepare_next,
+                event_type,event_details,generated_blurb,status)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (author_key,author_name,now,now,ay,newsletter_period,record_type,subject_final,title,
+                 recent,family,next_up,prepare,event_type,event_details,generated,"Draft"))
+            bid=int(cur.lastrowid); c.commit(); c.close()
+            save_newsletter_version(bid,"Draft Saved",generated,author_key,author_name)
+            st.success("Draft saved to your Newsletter archive.")
+
+        if save2.button("📨 Save & Submit to Newsletter",type="primary",key="newsletter_submit",use_container_width=True):
+            if not generated.strip():
+                st.warning("Generate or type the blurb before submitting.")
+            else:
+                now=datetime.now().isoformat(timespec="minutes")
+                c=conn()
+                cur=c.execute("""INSERT INTO newsletter_blurbs(
+                    author_key,author_name,created_at,updated_at,academic_year,newsletter_period,
+                    blurb_type,subject,title,recently_taught,family_help,coming_next,prepare_next,
+                    event_type,event_details,generated_blurb,status,submitted_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (author_key,author_name,now,now,ay,newsletter_period,record_type,subject_final,title,
+                     recent,family,next_up,prepare,event_type,event_details,generated,"Submitted",now))
+                bid=int(cur.lastrowid); c.commit(); c.close()
+                save_newsletter_version(bid,"Submitted",generated,author_key,author_name)
+                st.success("Submitted. Everyone can now see this blurb in Submitted Blurbs.")
+
+        st.caption("Teaching multiple subjects? Save/submit this one, choose your next subject, and create the next blurb.")
+
+    with tabs[1]:
+        submitted=newsletter_rows(newsletter_period if newsletter_period.strip() else None)
+        submitted=submitted[submitted.status.isin(["Submitted","Finalized"])] if not submitted.empty else submitted
+        if submitted.empty:
+            st.caption("No submitted blurbs yet.")
+        else:
+            for _,r in submitted.iterrows():
+                heading=r["title"] or r["subject"] or r["event_type"] or "Newsletter Blurb"
+                with st.expander(f"{r['status']} • {heading} • {r['author_name']}",expanded=False):
+                    st.caption(f"{r['newsletter_period'] or 'No issue set'} • Updated {r['updated_at']}")
+                    st.text_area("Submitted blurb",value=r["generated_blurb"] or "",height=150,disabled=True,key=f"shared_newsletter_{int(r['id'])}")
+
+    with tabs[2]:
+        mine=newsletter_rows()
+        mine=mine[mine.author_key==author_key] if not mine.empty else mine
+        if mine.empty:
+            st.caption("You have not saved any newsletter blurbs yet.")
+        else:
+            for _,r in mine.iterrows():
+                bid=int(r["id"])
+                heading=r["title"] or r["subject"] or r["event_type"] or "Newsletter Blurb"
+                with st.expander(f"{r['status']} • {heading} • {r['updated_at']}",expanded=False):
+                    edit_text=st.text_area("Your saved blurb",value=r["generated_blurb"] or "",height=155,key=f"mine_newsletter_edit_{bid}")
+                    ec1,ec2=st.columns(2)
+                    if ec1.button("Save My Changes",key=f"mine_newsletter_save_{bid}",use_container_width=True):
+                        now=datetime.now().isoformat(timespec="minutes")
+                        c=conn()
+                        c.execute("UPDATE newsletter_blurbs SET generated_blurb=?,updated_at=? WHERE id=? AND author_key=?",
+                                  (edit_text,now,bid,author_key))
+                        c.commit(); c.close()
+                        save_newsletter_version(bid,"Author Edited",edit_text,author_key,author_name)
+                        st.rerun()
+                    if r["status"]=="Draft":
+                        if ec2.button("Submit This Draft",key=f"mine_newsletter_submit_{bid}",use_container_width=True):
+                            now=datetime.now().isoformat(timespec="minutes")
+                            c=conn()
+                            c.execute("""UPDATE newsletter_blurbs SET status='Submitted',
+                                       submitted_at=?,updated_at=? WHERE id=? AND author_key=?""",
+                                      (now,now,bid,author_key))
+                            c.commit(); c.close()
+                            save_newsletter_version(bid,"Submitted",edit_text,author_key,author_name)
+                            st.rerun()
+                    c=conn()
+                    versions=pd.read_sql_query(
+                        """SELECT saved_at,action,author_name
+                           FROM newsletter_blurb_versions WHERE blurb_id=?
+                           ORDER BY id DESC""",c,params=[bid]
+                    )
+                    c.close()
+                    if not versions.empty:
+                        st.caption(f"{len(versions)} saved version(s) kept as receipts.")
+                        st.dataframe(versions,hide_index=True,use_container_width=True)
+
+    if is_lead:
+        with tabs[3]:
+            st.markdown("### Newsletter Lead Workspace")
+            st.caption("Newsletter Lead can edit submitted blurbs from all teachers and finalize them for the newsletter.")
+            all_sub=newsletter_rows(newsletter_period if newsletter_period.strip() else None)
+            all_sub=all_sub[all_sub.status.isin(["Submitted","Finalized"])] if not all_sub.empty else all_sub
+            if all_sub.empty:
+                st.caption("No submitted blurbs are waiting.")
+            else:
+                for _,r in all_sub.iterrows():
+                    bid=int(r["id"])
+                    heading=r["title"] or r["subject"] or r["event_type"] or "Newsletter Blurb"
+                    with st.expander(f"{r['status']} • {r['author_name']} • {heading}",expanded=False):
+                        lead_edit=st.text_area("Newsletter copy",value=r["generated_blurb"] or "",height=160,key=f"lead_newsletter_edit_{bid}")
+                        l1,l2=st.columns(2)
+                        if l1.button("Save Lead Edit",key=f"lead_newsletter_save_{bid}",use_container_width=True):
+                            now=datetime.now().isoformat(timespec="minutes")
+                            c=conn()
+                            c.execute("UPDATE newsletter_blurbs SET generated_blurb=?,updated_at=? WHERE id=?",(lead_edit,now,bid))
+                            c.commit(); c.close()
+                            save_newsletter_version(bid,"Newsletter Lead Edited",lead_edit,author_key,author_name)
+                            st.rerun()
+                        if l2.button("✅ Finalize Blurb",key=f"lead_newsletter_finalize_{bid}",use_container_width=True):
+                            now=datetime.now().isoformat(timespec="minutes")
+                            c=conn()
+                            c.execute("""UPDATE newsletter_blurbs SET generated_blurb=?,status='Finalized',
+                                       finalized_at=?,updated_at=? WHERE id=?""",(lead_edit,now,now,bid))
+                            c.commit(); c.close()
+                            save_newsletter_version(bid,"Finalized",lead_edit,author_key,author_name)
+                            st.rerun()
+
+            if not all_sub.empty:
+                final_copy=[]
+                for _,r in all_sub.iterrows():
+                    heading=r["title"] or r["subject"] or r["event_type"] or "Update"
+                    final_copy.append(f"{heading}\n{r['generated_blurb']}\n— {r['author_name']}")
+                st.text_area("All submitted blurbs — copy into newsletter",value="\n\n".join(final_copy),height=360,key="newsletter_all_copy")
 
 elif page=="Class Dashboard":
     if not selected_class:
@@ -4807,16 +5133,8 @@ elif page=="Little Assistant":
             st.button("Generate Phone Call Script",disabled=True,key="la_preview_call_generate")
             st.text_area("Editable phone call script",height=180,disabled=True,key="la_preview_call_text")
     else:
-        sid=st.selectbox("Scholar",list(roster.id.astype(int)),
-                         format_func=lambda x:nm(roster[roster.id==x].iloc[0]),
-                         key="assistant_scholar")
-        scholar=roster[roster.id==sid].iloc[0]
-        name=nm(scholar)
-        pro=scholar_pronouns(sid)
-        subj_pr=pro["subject"]
-        poss_pr=pro["possessive"]
-
         if tool=="IEP / Student Support":
+            sid,scholar,name,pro,subj_pr,poss_pr=assistant_scholar_context(roster,"assistant_iep")
             st.markdown("### Profile & Data Prefill")
             prefill=iep_prefill_summary(sid)
             st.text_area("Existing scholar data",value=prefill,height=260,disabled=True)
@@ -4911,6 +5229,7 @@ elif page=="Little Assistant":
             st.text_area("Editable teacher support summary",value=st.session_state.get("assistant_support_summary",""),height=380)
 
         elif tool=="IAT Referral":
+            sid,scholar,name,pro,subj_pr,poss_pr=assistant_scholar_context(roster,"assistant_iat")
             st.markdown("### IAT Referral Writer")
             st.caption(
                 "Build a classroom-based referral using the scholar's existing academic data, "
@@ -5243,6 +5562,7 @@ elif page=="Little Assistant":
                     st.dataframe(work_history.head(8),hide_index=True,use_container_width=True)
 
         elif tool=="Parent Message":
+            sid,scholar,name,pro,subj_pr,poss_pr=assistant_scholar_context(roster,"assistant_parent")
             gmap=guardian_display_map(sid)
             pref=update_preference(sid)
             default_gid=0
@@ -5345,6 +5665,7 @@ elif page=="Little Assistant":
                 st.success("Message saved to the selected parent's communication log.")
 
         elif tool=="Phone Call Script":
+            sid,scholar,name,pro,subj_pr,poss_pr=assistant_scholar_context(roster,"assistant_call")
             gmap=guardian_display_map(sid)
             gid=st.selectbox("Parent / Guardian",list(gmap),format_func=lambda x:gmap[x],key="assistant_call_guardian")
 
