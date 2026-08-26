@@ -539,6 +539,26 @@ def init_db():
         author_key TEXT PRIMARY KEY,
         is_newsletter_lead INTEGER DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS newsletter_requests(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_by_key TEXT NOT NULL,
+        created_by_name TEXT DEFAULT '',
+        created_at TEXT NOT NULL,
+        newsletter_period TEXT DEFAULT '',
+        due_date TEXT DEFAULT '',
+        audience_type TEXT DEFAULT 'Everyone',
+        audience_value TEXT DEFAULT '',
+        required_subjects TEXT DEFAULT '',
+        instructions TEXT DEFAULT '',
+        active INTEGER DEFAULT 1
+    );
+    CREATE TABLE IF NOT EXISTS feature_rollout(
+        feature_key TEXT PRIMARY KEY,
+        enabled INTEGER DEFAULT 0,
+        rollout_stage TEXT DEFAULT 'Creator Only',
+        updated_at TEXT DEFAULT '',
+        updated_by TEXT DEFAULT ''
+    );
     CREATE TABLE IF NOT EXISTS communications(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         scholar_id INTEGER, guardian_id INTEGER,
@@ -3061,6 +3081,80 @@ def assistant_scholar_context(roster,key_prefix):
     pro=scholar_pronouns(sid)
     return sid,scholar,name,pro,pro["subject"],pro["possessive"]
 
+
+# ---------- Creator Rollout Controls ----------
+def is_creator_account():
+    auth=auth_config() or {}
+    # Current single-account build treats the configured ChapLab account as Creator/Admin.
+    return current_author_key()==str(auth.get("username","")).strip().lower()
+
+def rollout_setting(feature_key):
+    c=conn()
+    r=c.execute("SELECT * FROM feature_rollout WHERE feature_key=?",(feature_key,)).fetchone()
+    c.close()
+    if r:
+        return dict(r)
+    return {"feature_key":feature_key,"enabled":0,"rollout_stage":"Creator Only"}
+
+def save_rollout_setting(feature_key,enabled,stage):
+    c=conn()
+    c.execute("""INSERT INTO feature_rollout(feature_key,enabled,rollout_stage,updated_at,updated_by)
+                 VALUES (?,?,?,?,?)
+                 ON CONFLICT(feature_key) DO UPDATE SET
+                   enabled=excluded.enabled,
+                   rollout_stage=excluded.rollout_stage,
+                   updated_at=excluded.updated_at,
+                   updated_by=excluded.updated_by""",
+              (feature_key,1 if enabled else 0,stage,datetime.now().isoformat(timespec="minutes"),current_author_name()))
+    c.commit(); c.close()
+
+def newsletter_request_rows(active_only=True):
+    c=conn()
+    q="SELECT * FROM newsletter_requests"
+    if active_only:
+        q+=" WHERE active=1"
+    q+=" ORDER BY COALESCE(due_date,'') ASC,id DESC"
+    df=pd.read_sql_query(q,c)
+    c.close()
+    return df
+
+def newsletter_submission_status(request_row,author_key,subjects):
+    period=str(request_row.get("newsletter_period") or "")
+    rows=newsletter_rows(period if period else None)
+    if rows.empty:
+        return []
+    rows=rows[rows.author_key==author_key]
+    statuses=[]
+    for subj in subjects:
+        sr=rows[(rows.subject==subj) & (rows.status.isin(["Submitted","Finalized"]))]
+        statuses.append((subj,"Submitted" if not sr.empty else "Not Submitted"))
+    return statuses
+
+def applicable_newsletter_requests(author_key,profile):
+    df=newsletter_request_rows(True)
+    if df.empty:
+        return df
+    grade=str(profile.get("grade_title") or "").lower()
+    homeroom=str(profile.get("homeroom") or "").lower()
+    subjects=[str(s).lower() for s in profile.get("subjects",[])]
+    keep=[]
+    for _,r in df.iterrows():
+        at=str(r["audience_type"] or "Everyone")
+        av=str(r["audience_value"] or "").lower()
+        ok=False
+        if at=="Everyone":
+            ok=True
+        elif at=="Grade / Team":
+            ok=(av in grade) or (av in homeroom)
+        elif at=="Subject Team":
+            ok=any(av==s or av in s for s in subjects)
+        elif at=="Selected People":
+            vals=[x.strip().lower() for x in av.split(",") if x.strip()]
+            ok=(author_key.lower() in vals) or (current_author_name().lower() in vals)
+        if ok:
+            keep.append(r)
+    return pd.DataFrame(keep) if keep else pd.DataFrame(columns=df.columns)
+
 # ---------- App Shell ----------
 cdf=classes_df()
 folder={0:"All Classes", **{int(r.id):r.class_name for _,r in cdf.iterrows()}}
@@ -3248,6 +3342,52 @@ with st.container(border=True):
             st.success("Newsletter role saved.")
             st.rerun()
 
+        if is_creator_account():
+            st.markdown("---")
+            st.markdown("#### 🔐 Creator Rollout Controls")
+            st.caption("Keep unfinished roles/features hidden until you move them through testing.")
+
+            rollout_stages=[
+                "Creator Only",
+                "Creator + Grade Team",
+                "Creator + Grade Team + Dean",
+                "School Pilot",
+                "Released"
+            ]
+            feature_defs=[
+                ("self_signup","Staff Self-Signup / Pending Approval"),
+                ("dean_role","Dean Role & Dashboard"),
+                ("sped_dean_role","SPED Dean Role"),
+                ("staff_roles","Expanded Staff Roles / Specials"),
+                ("cross_program","Cross-Program Collaboration"),
+            ]
+            changed=[]
+            for fkey,label in feature_defs:
+                cur=rollout_setting(fkey)
+                rc1,rc2=st.columns([1,2])
+                enabled=rc1.toggle(label,value=bool(cur.get("enabled",0)),key=f"rollout_enable_{fkey}")
+                current_stage=cur.get("rollout_stage","Creator Only")
+                if current_stage not in rollout_stages:
+                    current_stage="Creator Only"
+                stage=rc2.selectbox(
+                    f"{label} testing stage",
+                    rollout_stages,
+                    index=rollout_stages.index(current_stage),
+                    key=f"rollout_stage_{fkey}"
+                )
+                changed.append((fkey,enabled,stage))
+
+            if st.button("💾 Save Rollout Controls",key="save_rollout_controls"):
+                for fkey,enabled,stage in changed:
+                    save_rollout_setting(fkey,enabled,stage)
+                st.success("Rollout controls saved.")
+                st.rerun()
+
+            st.info(
+                "Current plan: Creator → Creator + Grade Team → Creator + Grade Team + Dean. "
+                "Dean/SPED Dean/cross-program features remain hidden until you turn them on."
+            )
+
 _nav=[("🏠 Dashboard","Home Page"),("🎓 Scholars","Scholars"),("Ⓐ Grades","Scholar Binder"),("📚 Book Leveler","Book Leveler"),("👥 Student Grouping","Student Grouping"),("📝 Report Comments","Report Card Comments"),("✨ Little Assistant","Little Assistant"),("📌 Bulletin Board","Bulletin Board"),("💬 Communication","Communication Log"),("⚙️ Web & Backup","Web & Backup")]
 cols=st.columns(10)
 for col,(label,target) in zip(cols,_nav):
@@ -3339,6 +3479,24 @@ if page=="Home Page":
         else:
             st.dataframe(pd.DataFrame(anns,columns=["Type","Reminder","Due"]),hide_index=True,use_container_width=True)
 
+
+    # Newsletter deadlines assigned by the Newsletter Lead / future Dean.
+    profile_now=teacher_dashboard_info()
+    assigned_requests=applicable_newsletter_requests(current_author_key(),profile_now)
+    if not assigned_requests.empty:
+        st.markdown("### ⏰ Newsletter Deadlines")
+        for _,req in assigned_requests.iterrows():
+            req_subjects=[x.strip() for x in str(req["required_subjects"] or "").split(",") if x.strip()]
+            due=req["due_date"] or "No due date"
+            with st.container(border=True):
+                st.markdown(f"**{req['newsletter_period'] or 'Newsletter Submission'}** — Due **{due}**")
+                st.caption(f"For: {req['audience_type']} {req['audience_value'] or ''}")
+                if req["instructions"]:
+                    st.write(req["instructions"])
+                if req_subjects:
+                    st.write("Required blurbs: "+", ".join(req_subjects))
+                    status_pairs=newsletter_submission_status(req,current_author_key(),req_subjects)
+                    st.write(" • ".join([f"{s}: {status}" for s,status in status_pairs]))
 
     st.markdown("---")
     st.markdown('<div class="page-title">📰 Newsletter Hub</div>',unsafe_allow_html=True)
@@ -3506,7 +3664,59 @@ if page=="Home Page":
     if is_lead:
         with tabs[3]:
             st.markdown("### Newsletter Lead Workspace")
-            st.caption("Newsletter Lead can edit submitted blurbs from all teachers and finalize them for the newsletter.")
+            st.caption("Newsletter Lead can set submission deadlines, assign who needs to submit, edit submitted blurbs, and finalize newsletter copy.")
+
+            st.markdown("#### 📅 Create Newsletter Request / Due Date")
+            with st.form("newsletter_request_form",clear_on_submit=True):
+                rq1,rq2=st.columns(2)
+                rq_period=rq1.text_input("Newsletter issue / week",value=newsletter_period,placeholder="Example: Week of September 14")
+                rq_due=rq2.date_input("Due date",value=date.today())
+                rq3,rq4=st.columns(2)
+                rq_audience=rq3.selectbox("Who needs to submit?",["Everyone","Grade / Team","Subject Team","Selected People"])
+                rq_value=rq4.text_input(
+                    "Grade/team/subject/people",
+                    placeholder="Examples: Grade 3 | Science | chapman, smith"
+                )
+                rq_subjects=st.multiselect(
+                    "Required subject blurbs",
+                    ["ELA","Math","Science","Social Studies","Art","Music","Physical Education / Gym","Technology","Library / Media","STEM","Health","World Language","Intervention / AIS","ENL / ELL","Special Education","Other / Custom"]
+                )
+                rq_subject_other=st.text_input("Other / custom required subject")
+                rq_instructions=st.text_area("Instructions / notes",placeholder="Anything staff should include in this newsletter issue.")
+                if st.form_submit_button("Create Newsletter Request",use_container_width=True):
+                    subjects=list(rq_subjects)
+                    if rq_subject_other.strip():
+                        subjects.append(rq_subject_other.strip())
+                    c=conn()
+                    c.execute("""INSERT INTO newsletter_requests(
+                        created_by_key,created_by_name,created_at,newsletter_period,due_date,
+                        audience_type,audience_value,required_subjects,instructions,active)
+                        VALUES (?,?,?,?,?,?,?,?,?,1)""",
+                        (current_author_key(),current_author_name(),datetime.now().isoformat(timespec="minutes"),
+                         rq_period.strip(),str(rq_due),rq_audience,rq_value.strip(),
+                         ",".join(subjects),rq_instructions.strip()))
+                    c.commit(); c.close()
+                    st.success("Newsletter request created.")
+                    st.rerun()
+
+            requests=newsletter_request_rows(True)
+            if not requests.empty:
+                st.markdown("#### Active Newsletter Requests")
+                for _,req in requests.iterrows():
+                    rid=int(req["id"])
+                    with st.expander(f"{req['newsletter_period'] or 'Newsletter Request'} • Due {req['due_date'] or 'TBD'}",expanded=False):
+                        st.write(f"Audience: **{req['audience_type']}** {req['audience_value'] or ''}")
+                        st.write(f"Required blurbs: {req['required_subjects'] or 'Not specified'}")
+                        if req["instructions"]:
+                            st.write(req["instructions"])
+                        if st.button("Close Request",key=f"close_news_req_{rid}"):
+                            c=conn()
+                            c.execute("UPDATE newsletter_requests SET active=0 WHERE id=?",(rid,))
+                            c.commit(); c.close()
+                            st.rerun()
+
+            st.markdown("---")
+            st.markdown("#### Submitted Newsletter Blurbs")
             all_sub=newsletter_rows(newsletter_period if newsletter_period.strip() else None)
             all_sub=all_sub[all_sub.status.isin(["Submitted","Finalized"])] if not all_sub.empty else all_sub
             if all_sub.empty:
