@@ -479,6 +479,27 @@ def init_db():
         points_earned REAL,
         UNIQUE(scholar_id, assignment_id)
     );
+    CREATE TABLE IF NOT EXISTS bulletin_board_work(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scholar_id INTEGER,
+        created_at TEXT NOT NULL,
+        title TEXT DEFAULT '',
+        subject TEXT DEFAULT 'ELA',
+        task_text TEXT DEFAULT '',
+        vocabulary TEXT DEFAULT '',
+        standards TEXT DEFAULT '',
+        rubric_text TEXT DEFAULT '',
+        work_file_name TEXT DEFAULT '',
+        work_file_path TEXT DEFAULT '',
+        glow_1 TEXT DEFAULT '',
+        glow_2 TEXT DEFAULT '',
+        grow TEXT DEFAULT '',
+        final_feedback TEXT DEFAULT '',
+        grade_value REAL,
+        points_possible REAL DEFAULT 100,
+        include_in_gradebook INTEGER DEFAULT 0,
+        assignment_id INTEGER
+    );
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);
     CREATE TABLE IF NOT EXISTS communications(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -703,6 +724,7 @@ def init_db():
     addcol(cur,"book_catalog","fp_level","TEXT DEFAULT ''")
     addcol(cur,"book_catalog","isbn","TEXT DEFAULT ''")
     addcol(cur,"book_catalog","notes","TEXT DEFAULT ''")
+    addcol(cur,"assignments","include_in_average","INTEGER DEFAULT 1")
     addcol(cur,"communications","guardian_id","INTEGER")
     addcol(cur,"support_notes","concern_category","TEXT DEFAULT ''")
     addcol(cur,"support_notes","frequency_choice","TEXT DEFAULT ''")
@@ -1909,6 +1931,7 @@ def open_side_section(section_name):
         "grouping":"Student Grouping",
         "reports":"Report Card Comments",
         "assistant":"Little Assistant",
+        "bulletin":"Bulletin Board",
         "communication":"Communication Log",
         "web":"Web & Backup",
     }
@@ -2941,7 +2964,7 @@ if not st.session_state["selected_class"] and not cdf.empty:
 
 selected_class=st.session_state["selected_class"]
 
-internal_pages=["Home Page","Class Dashboard","Scholars","Scholar Profile","Scholar Binder","Book Leveler","Student Grouping","Report Card Comments","Little Assistant","Communication Log","Web & Backup"]
+internal_pages=["Home Page","Class Dashboard","Scholars","Scholar Profile","Scholar Binder","Book Leveler","Student Grouping","Report Card Comments","Little Assistant","Bulletin Board","Communication Log","Web & Backup"]
 if "nav_page" not in st.session_state or st.session_state["nav_page"] not in internal_pages:
     st.session_state["nav_page"]="Home Page"
 
@@ -3022,6 +3045,7 @@ nav_items=[
     ("👥","Student Grouping","Student Grouping"),
     ("📝","Report Card Comments","Report Card Comments"),
     ("✨","Little Assistant","Little Assistant"),
+    ("📌","Bulletin Board","Bulletin Board"),
     ("💬","Communication Log","Communication Log"),
     ("⚙️","Web & Backup","Web & Backup"),
 ]
@@ -3100,8 +3124,8 @@ with st.container(border=True):
             st.session_state["show_teacher_profile_settings"]=False
             st.rerun()
 
-_nav=[("🏠 Dashboard","Home Page"),("🎓 Scholars","Scholars"),("Ⓐ Grades","Scholar Binder"),("📚 Book Leveler","Book Leveler"),("👥 Student Grouping","Student Grouping"),("📝 Report Comments","Report Card Comments"),("✨ Little Assistant","Little Assistant"),("💬 Communication","Communication Log"),("⚙️ Web & Backup","Web & Backup")]
-cols=st.columns(9)
+_nav=[("🏠 Dashboard","Home Page"),("🎓 Scholars","Scholars"),("Ⓐ Grades","Scholar Binder"),("📚 Book Leveler","Book Leveler"),("👥 Student Grouping","Student Grouping"),("📝 Report Comments","Report Card Comments"),("✨ Little Assistant","Little Assistant"),("📌 Bulletin Board","Bulletin Board"),("💬 Communication","Communication Log"),("⚙️ Web & Backup","Web & Backup")]
+cols=st.columns(10)
 for col,(label,target) in zip(cols,_nav):
     with col:
         if st.button(label,key=f"topnav_{target}",use_container_width=True,type="primary" if page==target else "secondary"):
@@ -4694,30 +4718,92 @@ elif page=="Little Assistant":
 
         elif tool=="IAT Referral":
             st.markdown("### IAT Referral Writer")
-            st.caption("The referral will combine academic data, intervention evidence, work samples, and family contact history.")
-            st.text_area("Primary concern / reason for referral",height=100,key="la_preview_iat_concern")
-            st.text_area("Strategies and interventions already tried",height=100,key="la_preview_iat_interventions")
-            st.text_area("Response to interventions",height=100,key="la_preview_iat_response")
+            st.caption("Choose from guided options or use Other / Custom when you need your own wording.")
+            p1,p2=st.columns(2)
+            p1.selectbox("Primary reason for referral",[
+                "Academic progress below expectations","Reading difficulty","Writing difficulty","Math difficulty",
+                "Attention / focus concerns","Task completion / work habits","Behavior / self-management",
+                "Social / peer interaction","Communication concerns","Attendance / missed instruction",
+                "Multiple areas of concern","Other / Custom"
+            ],key="la_preview_iat_reason")
+            p2.text_input("Other / custom reason",placeholder="Type your own reason",key="la_preview_iat_reason_other")
+            st.multiselect("Areas of concern",[
+                "Reading fluency","Reading comprehension","Phonics / decoding","Vocabulary","Written expression",
+                "Spelling / conventions","Math computation","Math problem solving","Following directions",
+                "Attention / focus","Task initiation","Task completion","Organization","Behavior regulation",
+                "Peer interaction","Participation","Independence","Communication","Other / Custom"
+            ],key="la_preview_iat_areas")
+            st.text_input("Other / custom area of concern",key="la_preview_iat_area_other")
+            p3,p4=st.columns(2)
+            p3.selectbox("How long has this been observed?",[
+                "Less than 1 month","1–2 months","3–4 months","Most of the school year",
+                "Since the beginning of the school year","Other / Custom"
+            ],key="la_preview_iat_duration")
+            p4.text_input("Other / custom duration",key="la_preview_iat_duration_other")
+            st.multiselect("Classroom supports already tried",[
+                "Small-group reteach","1:1 teacher conference","Preferential seating","Directions broken into steps",
+                "Visual checklist / reminder","Frequent check-ins","Extended time","Reduced task length",
+                "Graphic organizer","Model/example provided","Repeated practice","Read directions aloud",
+                "Peer support","Positive reinforcement","Behavior reminder / redirection","Home practice requested",
+                "Family contacted","Progress monitoring","Other / Custom"
+            ],key="la_preview_iat_supports")
+            st.text_area("Other / custom support or additional details",height=85,key="la_preview_iat_support_other")
+            p5,p6=st.columns(2)
+            p5.selectbox("Response to support",[
+                "Improved with support","Some improvement, but concern remains","Improvement was temporary",
+                "Performance remains inconsistent","Minimal or no improvement","More data is needed","Other / Custom"
+            ],key="la_preview_iat_response")
+            p6.text_input("Other / custom response",key="la_preview_iat_response_other")
+            st.text_area("Objective description / examples",height=100,key="la_preview_iat_objective")
             st.button("Generate IAT Referral",disabled=True,key="la_preview_iat_generate")
             st.text_area("Editable IAT referral",height=220,disabled=True,key="la_preview_iat_text")
 
         elif tool=="Parent Message":
             st.markdown("### Parent Message")
+            st.caption("Use the dropdowns for quick setup, or choose Other / Custom and type exactly what you need.")
             p1,p2=st.columns(2)
-            p1.selectbox("Message type",["Positive update","Academic concern","Behavior concern","Missing work","Progress update","Reminder","Other"],key="la_preview_parent_type")
-            p2.selectbox("Subject",["General","ELA","Math","Science","Social Studies","Behavior"],key="la_preview_parent_subject")
+            p1.selectbox("Message type",[
+                "Positive update","Progress update","Growth update","Academic concern","Behavior concern",
+                "Missing work","Homework reminder","Assessment / test","Conference request",
+                "Injury / classroom incident","General reminder","Other / Custom"
+            ],key="la_preview_parent_type")
+            p2.selectbox("Subject",["General","ELA","Math","Science","Social Studies","Behavior","Attendance","Other / Custom"],key="la_preview_parent_subject")
+            c1,c2=st.columns(2)
+            c1.text_input("Other / custom message type",key="la_preview_parent_type_other")
+            c2.text_input("Other / custom subject",key="la_preview_parent_subject_other")
+            st.selectbox("Tone",["Warm & supportive","Positive & celebratory","Direct & professional","Concerned but supportive","Brief reminder","Other / Custom"],key="la_preview_parent_tone")
+            st.text_input("Other / custom tone",key="la_preview_parent_tone_other")
             st.text_area("What happened / what should the family know?",height=110,key="la_preview_parent_details")
-            st.text_area("Next step / request",height=90,key="la_preview_parent_next")
+            st.selectbox("Requested next step",[
+                "No action needed — informational only","Please discuss with scholar","Please complete/return work",
+                "Please practice at home","Please reply to this message","Please schedule a conference",
+                "I will follow up again","Other / Custom"
+            ],key="la_preview_parent_next_choice")
+            st.text_area("Other / custom next step or additional request",height=80,key="la_preview_parent_next")
             st.button("Generate Parent Message",disabled=True,key="la_preview_parent_generate")
             st.text_area("Editable parent message",height=180,disabled=True,key="la_preview_parent_text")
 
         elif tool=="Phone Call Script":
             st.markdown("### Phone Call Script")
+            st.caption("Choose the reason, subject, tone, and goal of the call. Other / Custom lets you enter your own.")
             p1,p2=st.columns(2)
-            p1.selectbox("Reason for call",["Positive update","Academic concern","Behavior concern","Missing work","Progress update","Follow-up","Other"],key="la_preview_call_reason")
-            p2.selectbox("Subject",["General","ELA","Math","Science","Social Studies","Behavior"],key="la_preview_call_subject")
+            p1.selectbox("Reason for call",[
+                "Positive update","Progress update","Academic concern","Behavior concern","Missing work",
+                "Attendance / lateness","Assessment / test","Injury / classroom incident",
+                "Conference request","Follow-up from previous contact","Other / Custom"
+            ],key="la_preview_call_reason")
+            p2.selectbox("Subject",["General","ELA","Math","Science","Social Studies","Behavior","Attendance","Other / Custom"],key="la_preview_call_subject")
+            c1,c2=st.columns(2)
+            c1.text_input("Other / custom reason",key="la_preview_call_reason_other")
+            c2.text_input("Other / custom subject",key="la_preview_call_subject_other")
+            st.selectbox("Tone",["Warm & conversational","Positive & celebratory","Direct & professional","Concerned but supportive","Other / Custom"],key="la_preview_call_tone")
+            st.text_input("Other / custom tone",key="la_preview_call_tone_other")
             st.text_area("Key details to discuss",height=110,key="la_preview_call_details")
-            st.text_area("Desired next steps",height=90,key="la_preview_call_next")
+            st.selectbox("Desired outcome / next step",[
+                "Inform family only","Ask family to reinforce at home","Create a school-home plan",
+                "Schedule a conference","Ask family for input","Follow up again later","Other / Custom"
+            ],key="la_preview_call_next_choice")
+            st.text_area("Other / custom next step or additional details",height=90,key="la_preview_call_next")
             st.button("Generate Phone Call Script",disabled=True,key="la_preview_call_generate")
             st.text_area("Editable phone call script",height=180,disabled=True,key="la_preview_call_text")
     else:
@@ -4936,16 +5022,20 @@ elif page=="Little Assistant":
                 concerns.append(custom_concern.strip())
 
             a,b=st.columns(2)
-            onset=a.selectbox(
+            onset_choice=a.selectbox(
                 "How long has the concern been observed?",
-                ["Less than 1 month","1–2 months","3–4 months","Most of the school year","Since the beginning of the school year","Other"],
+                ["Less than 1 month","1–2 months","3–4 months","Most of the school year","Since the beginning of the school year","Other / Custom"],
                 key="iat_duration"
             )
+            onset_custom=a.text_input("Other / custom duration",key="iat_duration_custom")
+            onset=onset_custom.strip() if onset_choice=="Other / Custom" and onset_custom.strip() else onset_choice
             setting=b.multiselect(
                 "Where is the concern most noticeable?",
-                ["Whole group","Small group","Independent work","Assessments","Transitions","Unstructured time","Across settings"],
+                ["Whole group","Small group","Independent work","Assessments","Transitions","Unstructured time","Across settings","Other / Custom"],
                 key="iat_settings"
             )
+            setting_custom=b.text_input("Other / custom setting",key="iat_setting_custom")
+            setting=[x for x in setting if x!="Other / Custom"] + ([setting_custom.strip()] if setting_custom.strip() else [])
 
             objective_description=st.text_area(
                 "Objective description of the concern",
@@ -4970,10 +5060,12 @@ elif page=="Little Assistant":
                     "Extended time","Reduced task length","Graphic organizer","Model/example provided",
                     "Repeated practice","Read directions aloud","Peer support","Positive reinforcement",
                     "Behavior reminder / redirection","Home practice requested","Family contacted",
-                    "Progress monitoring","Other"
+                    "Progress monitoring","Other / Custom"
                 ],
                 key="iat_interventions"
             )
+            custom_intervention=st.text_input("Other / custom intervention",key="iat_intervention_custom")
+            selected_interventions=[x for x in selected_interventions if x!="Other / Custom"] + ([custom_intervention.strip()] if custom_intervention.strip() else [])
             intervention_details=st.text_area(
                 "Intervention details",
                 placeholder="Include frequency, duration, and what the support looked like.",
@@ -4988,10 +5080,13 @@ elif page=="Little Assistant":
                     "Improvement was temporary",
                     "Performance remains inconsistent",
                     "Minimal or no improvement",
-                    "More data is needed"
+                    "More data is needed",
+                    "Other / Custom"
                 ],
                 key="iat_response"
             )
+            response_custom=st.text_input("Other / custom response",key="iat_response_custom")
+            response_to_support=response_custom.strip() if response_to_support=="Other / Custom" and response_custom.strip() else response_to_support
 
             st.markdown("#### Strengths & Family Communication")
             strengths_note=st.text_area(
@@ -5158,9 +5253,11 @@ elif page=="Little Assistant":
             requested=st.checkbox("Parent requested regular updates",
                                   value=bool(pref["requested_updates"]) if pref else False,
                                   key="assistant_requested_updates")
-            frequency_options=["","Weekly","Every 2 Weeks","Monthly","End of Quarter","As Needed"]
+            frequency_options=["","Weekly","Every 2 Weeks","Monthly","End of Quarter","As Needed","Other / Custom"]
             current_freq=pref["update_frequency"] if pref and pref["update_frequency"] in frequency_options else ""
-            frequency=st.selectbox("Update frequency",frequency_options,index=frequency_options.index(current_freq),key="assistant_update_frequency")
+            frequency_choice=st.selectbox("Update frequency",frequency_options,index=frequency_options.index(current_freq),key="assistant_update_frequency")
+            frequency_custom=st.text_input("Other / custom update frequency",key="assistant_update_frequency_other")
+            frequency=frequency_custom.strip() if frequency_choice=="Other / Custom" and frequency_custom.strip() else frequency_choice
             gids=list(gmap)
             gid=st.selectbox("Parent / Guardian",gids,format_func=lambda x:gmap[x],
                              index=gids.index(default_gid) if default_gid in gids else 0,
@@ -5173,33 +5270,74 @@ elif page=="Little Assistant":
                 st.success("Parent update preference saved.")
                 st.rerun()
 
-            subj=st.selectbox("Subject",["General","ELA","Math","Science","Social Studies"],key="assistant_msg_subject")
-            reason=st.selectbox("Message Type",[
+            c1,c2=st.columns(2)
+            subj_choice=c1.selectbox("Subject",["General","ELA","Math","Science","Social Studies","Behavior","Attendance","Other / Custom"],key="assistant_msg_subject")
+            subject_custom=c1.text_input("Other / custom subject",key="assistant_msg_subject_other")
+            subj=subject_custom.strip() if subj_choice=="Other / Custom" and subject_custom.strip() else subj_choice
+
+            reason_choice=c2.selectbox("Message Type",[
                 "Progress update","Growth update","At-risk / concern update","Positive update",
                 "Homework reminder","Missing assignment","Behavior concern","Academic concern",
-                "Injury / classroom incident","General update"
+                "Assessment / test","Attendance / lateness","Conference request",
+                "Injury / classroom incident","General update","Other / Custom"
             ],key="assistant_msg_reason")
+            reason_custom=c2.text_input("Other / custom message type",key="assistant_msg_reason_other")
+            reason=reason_custom.strip() if reason_choice=="Other / Custom" and reason_custom.strip() else reason_choice
+
+            t1,t2=st.columns(2)
+            tone_choice=t1.selectbox("Tone",[
+                "Warm & supportive","Positive & celebratory","Direct & professional",
+                "Concerned but supportive","Brief reminder","Other / Custom"
+            ],key="assistant_msg_tone")
+            tone_custom=t1.text_input("Other / custom tone",key="assistant_msg_tone_other")
+            tone=tone_custom.strip() if tone_choice=="Other / Custom" and tone_custom.strip() else tone_choice
+
+            next_choice=t2.selectbox("Requested next step",[
+                "No action needed — informational only","Please discuss with scholar",
+                "Please complete/return work","Please practice at home","Please reply to this message",
+                "Please schedule a conference","I will follow up again","Other / Custom"
+            ],key="assistant_msg_next_choice")
+            next_custom=t2.text_input("Other / custom next step",key="assistant_msg_next_other")
+            next_step=next_custom.strip() if next_choice=="Other / Custom" and next_custom.strip() else next_choice
+
             details=st.text_area("Specific information to add",key="assistant_msg_details")
 
             if st.button("Generate Data-Informed Parent Update",key="assistant_generate_msg"):
                 parent_name=gmap.get(gid,"").split(" (")[0] if gid else ""
                 greeting=f"Hello {parent_name}," if parent_name else "Hello,"
-                if reason in ["Progress update","Growth update","At-risk / concern update"]:
+                if reason_choice in ["Progress update","Growth update","At-risk / concern update"]:
                     body=generate_parent_progress_update(sid,subj)
                     if details.strip():
                         body += " " + details.strip()
-                    msg=f"{greeting} {body}"
-                elif reason=="Positive update":
-                    msg=f"{greeting} I wanted to share a positive update about {name}. {details} Thank you for your continued support."
-                elif reason=="Homework reminder":
-                    msg=f"{greeting} this is a reminder regarding {name}'s {subj} homework. {details} Please have the assignment completed and returned as soon as possible. Thank you."
-                elif reason=="Behavior concern":
-                    msg=f"{greeting} I am reaching out regarding {name}'s behavior today. {details} Please speak with {name} about making choices that support learning and classroom expectations. Thank you for partnering with me."
-                elif reason=="Injury / classroom incident":
-                    msg=f"{greeting} I am contacting you to make you aware of an incident involving {name} today. {details} I wanted to make sure you received this information directly."
+                elif reason_choice=="Positive update":
+                    body=f"I wanted to share a positive update about {name}. {details}".strip()
+                elif reason_choice=="Homework reminder":
+                    body=f"This is a reminder regarding {name}'s {subj} homework. {details}".strip()
+                elif reason_choice=="Behavior concern":
+                    body=f"I am reaching out regarding {name}'s behavior. {details}".strip()
+                elif reason_choice=="Injury / classroom incident":
+                    body=f"I am contacting you to make you aware of an incident involving {name}. {details}".strip()
                 else:
-                    msg=f"{greeting} I am reaching out with an update regarding {name}. {details} Thank you for your support."
-                st.session_state["assistant_parent_msg"]=msg
+                    body=f"I am reaching out regarding {reason.lower()} for {name}. {details}".strip()
+
+                tone_intro=""
+                if tone=="Positive & celebratory":
+                    tone_intro=" I am happy to share this update."
+                elif tone=="Concerned but supportive":
+                    tone_intro=" I want us to work together to support continued progress."
+                elif tone=="Brief reminder":
+                    tone_intro=" This is a quick reminder."
+                elif tone and tone not in ["Warm & supportive","Direct & professional"]:
+                    tone_intro=f" {tone}."
+
+                step_text=""
+                if next_step and next_step!="No action needed — informational only":
+                    step_text=f" Next step: {next_step}."
+                elif next_step=="No action needed — informational only":
+                    step_text=" No action is needed at this time; I just wanted to keep you informed."
+
+                msg=f"{greeting}{tone_intro} {body}{step_text} Thank you for your support."
+                st.session_state["assistant_parent_msg"]=re.sub(r"\\s+"," ",msg).strip()
 
             msg=st.text_area("Edit / copy message",value=st.session_state.get("assistant_parent_msg",""),height=260)
             if st.button("Save Message to Communication Log",key="assistant_log_msg"):
@@ -5209,115 +5347,232 @@ elif page=="Little Assistant":
         elif tool=="Phone Call Script":
             gmap=guardian_display_map(sid)
             gid=st.selectbox("Parent / Guardian",list(gmap),format_func=lambda x:gmap[x],key="assistant_call_guardian")
-            subj=st.selectbox("Subject",["ELA","Math","Science","Social Studies","General"],key="assistant_call_subject")
-            reason=st.selectbox("Reason",["Behavior concern","Academic concern","Missing work","Positive update","Injury / classroom incident","Conference request","General update"],key="assistant_call_reason")
-            details=st.text_area("Specific information",key="assistant_call_details")
+
+            c1,c2=st.columns(2)
+            subj_choice=c1.selectbox("Subject",["General","ELA","Math","Science","Social Studies","Behavior","Attendance","Other / Custom"],key="assistant_call_subject")
+            subj_custom=c1.text_input("Other / custom subject",key="assistant_call_subject_other")
+            subj=subj_custom.strip() if subj_choice=="Other / Custom" and subj_custom.strip() else subj_choice
+
+            reason_choice=c2.selectbox("Reason",[
+                "Positive update","Progress update","Academic concern","Behavior concern","Missing work",
+                "Attendance / lateness","Assessment / test","Injury / classroom incident",
+                "Conference request","Follow-up from previous contact","General update","Other / Custom"
+            ],key="assistant_call_reason")
+            reason_custom=c2.text_input("Other / custom reason",key="assistant_call_reason_other")
+            reason=reason_custom.strip() if reason_choice=="Other / Custom" and reason_custom.strip() else reason_choice
+
+            t1,t2=st.columns(2)
+            tone_choice=t1.selectbox("Tone",[
+                "Warm & conversational","Positive & celebratory","Direct & professional",
+                "Concerned but supportive","Other / Custom"
+            ],key="assistant_call_tone")
+            tone_custom=t1.text_input("Other / custom tone",key="assistant_call_tone_other")
+            tone=tone_custom.strip() if tone_choice=="Other / Custom" and tone_custom.strip() else tone_choice
+
+            next_choice=t2.selectbox("Desired outcome / next step",[
+                "Inform family only","Ask family to reinforce at home","Create a school-home plan",
+                "Schedule a conference","Ask family for input","Follow up again later","Other / Custom"
+            ],key="assistant_call_next_choice")
+            next_custom=t2.text_input("Other / custom outcome",key="assistant_call_next_other")
+            next_step=next_custom.strip() if next_choice=="Other / Custom" and next_custom.strip() else next_choice
+
+            details=st.text_area("Specific information / key details",key="assistant_call_details")
+
             if st.button("Generate Phone Script",key="assistant_generate_call"):
                 parent_label=gmap.get(gid,"the parent/guardian").split(" (")[0]
+                partnership={
+                    "Inform family only":"I wanted to make sure you had this information directly from me.",
+                    "Ask family to reinforce at home":"I would appreciate your help reinforcing this skill or expectation at home.",
+                    "Create a school-home plan":"I would like us to agree on a simple school-home plan so we can support the same goal consistently.",
+                    "Schedule a conference":"I would like to schedule a conference so we can discuss this more fully.",
+                    "Ask family for input":"I would also like to hear what you are noticing at home and any strategies that work well.",
+                    "Follow up again later":"I will continue monitoring this and follow up with you again."
+                }.get(next_step,f"I would like to work with you on this next step: {next_step}.")
+
+                tone_line=f"Tone: {tone}\n\n" if tone else ""
                 st.session_state["assistant_phone_script"]=f"""Opening:
 Hello, may I speak with {parent_label}? This is the teacher calling about {name}. Is now a good time to speak for a few minutes?
 
-Reason:
+{tone_line}Reason:
 I wanted to touch base regarding {reason.lower()} in {subj}.
 
 Specific information:
 {details or "I wanted to provide you with a clear classroom update."}
 
-Partnership:
-I will continue supporting and monitoring {name} at school. I would appreciate your help reinforcing the same expectations and/or skill at home.
+Partnership / Next Step:
+{partnership}
 
 Closing:
-Thank you for taking the time to speak with me. Please let me know if you have any questions."""
-            script=st.text_area("Edit / use during call",value=st.session_state.get("assistant_phone_script",""),height=320)
+Thank you for taking the time to speak with me. Please let me know if you have any questions or anything you would like me to know."""
+
+            script=st.text_area("Edit / use during call",value=st.session_state.get("assistant_phone_script",""),height=360)
             outcome=st.text_area("Call notes / parent response",key="assistant_call_outcome")
             if st.button("Save Call to Communication Log",key="assistant_log_call"):
                 log_communication(sid,gid,"Phone Call",subj,reason,outcome or details,script)
                 st.success("Phone call saved to the selected parent's communication log.")
 
-elif page=="Web & Backup":
-    st.markdown('<div class="page-title">Web & Backup</div><div class="page-subtitle">Cloud connection, backups, and migration tools for the browser version of ChapLab.</div>',unsafe_allow_html=True)
 
-    if cloud_configured():
-        st.success("☁️ Cloud storage is connected.")
-        cfg=cloud_config()
-        st.caption(f"Private bucket: {cfg['bucket']} • Database object: {cfg['db_object']}")
-        if st.session_state.get("_cloud_sync_error"):
-            st.warning("Last sync message: "+st.session_state["_cloud_sync_error"])
+elif page=="Bulletin Board":
+    st.markdown('<div class="page-title">Bulletin Board</div><div class="page-subtitle">Turn scholar work into display-ready feedback, standards, vocabulary, and an optional grade.</div>',unsafe_allow_html=True)
+    st.caption("Upload the scholar work and rubric, then build two glows and one grow in kid-friendly language with a little rigor.")
+
+    roster=scholars_df(selected_class or None)
+
+    if roster.empty:
+        st.info("No scholars yet. The Bulletin Board workspace is ready now; scholar names will populate automatically after you add your roster.")
+        b1,b2=st.columns(2)
+        b1.selectbox("Scholar",["No scholars yet"],disabled=True,key="bb_empty_scholar")
+        b2.selectbox("Subject",["ELA","Math","Science","Social Studies","Writing"],key="bb_empty_subject")
+        st.text_input("Display / assignment title",placeholder="Example: Character Traits Response",key="bb_empty_title")
+        st.file_uploader("Upload scholar work",type=["png","jpg","jpeg","pdf"],disabled=True,key="bb_empty_work")
+        st.file_uploader("Upload rubric",type=["pdf","png","jpg","jpeg","docx"],disabled=True,key="bb_empty_rubric_file")
+        st.text_area("Rubric / success criteria",placeholder="Paste the rubric or success criteria here.",key="bb_empty_rubric")
+        st.text_area("Task / prompt",placeholder="What were scholars asked to do?",key="bb_empty_task")
+        st.text_input("Vocabulary words used / expected",placeholder="Example: trait, evidence, infer, detail",key="bb_empty_vocab")
+        st.text_input("Standards",placeholder="Example: 3R3, 3W5",key="bb_empty_standards")
+        g1,g2=st.columns(2)
+        g1.text_area("Glow #1",placeholder="What did the scholar do well?",key="bb_empty_glow1")
+        g2.text_area("Glow #2",placeholder="What else did the scholar do well?",key="bb_empty_glow2")
+        st.text_area("Grow",placeholder="What is the clearest next step?",key="bb_empty_grow")
+        st.number_input("Grade",min_value=0.0,max_value=100.0,value=0.0,key="bb_empty_grade")
+        st.checkbox("Include this grade in the gradebook / report-card average",value=False,key="bb_empty_include")
+        st.button("Generate Bulletin Board Feedback",disabled=True,key="bb_empty_generate")
     else:
-        st.info("ChapLab is currently running in local mode.")
-        st.write("To use the same data from your school browser, deploy this Web Edition and add the Supabase settings shown in the deployment guide.")
+        top1,top2=st.columns(2)
+        sid=top1.selectbox("Scholar",list(roster.id.astype(int)),
+                           format_func=lambda x:nm(roster[roster.id==x].iloc[0]),key="bb_scholar")
+        subject=top2.selectbox("Subject",["ELA","Math","Science","Social Studies","Writing"],key="bb_subject")
+        scholar_name=nm(roster[roster.id==sid].iloc[0])
 
-    st.markdown("### Database Backup")
-    db_path=Path(DB)
-    if db_path.exists():
-        st.download_button(
-            "⬇️ Download Current ChapLab Database",
-            data=db_path.read_bytes(),
-            file_name="teacher_tracker_backup.db",
-            mime="application/x-sqlite3",
-            use_container_width=True,
-            key="download_db_backup_v4"
+        title=st.text_input("Display / assignment title",placeholder="Example: Character Traits Response",key="bb_title")
+
+        f1,f2=st.columns(2)
+        work=f1.file_uploader("Upload scholar work",type=["png","jpg","jpeg","pdf"],key="bb_work")
+        rubric_file=f2.file_uploader("Upload rubric",type=["pdf","png","jpg","jpeg","docx"],key="bb_rubric_file")
+
+        rubric=st.text_area(
+            "Rubric / success criteria",
+            placeholder="Paste the rubric language or the success criteria you want the feedback and grade based on.",
+            height=130,key="bb_rubric"
+        )
+        task=st.text_area("Task / prompt",placeholder="What were scholars asked to do?",height=90,key="bb_task")
+
+        v1,v2=st.columns(2)
+        vocab=v1.text_input("Vocabulary words used / expected",placeholder="Example: trait, evidence, infer, detail",key="bb_vocab")
+        standards=v2.text_input("Standards",placeholder="Example: 3R3, 3W5",key="bb_standards")
+
+        st.markdown("### Two Glows + One Grow")
+        st.caption("Use evidence from the work/rubric. ChapLab turns these notes into a polished, scholar-friendly comment.")
+        g1,g2=st.columns(2)
+        glow1=g1.text_area("Glow #1",placeholder="Example: Answered all parts of the prompt correctly.",height=95,key="bb_glow1")
+        glow2=g2.text_area("Glow #2",placeholder="Example: Used strong details from the text.",height=95,key="bb_glow2")
+        grow=st.text_area("Grow",placeholder="Example: Use capital letters and ending punctuation in every sentence.",height=95,key="bb_grow")
+
+        grade1,grade2,grade3=st.columns([1,1,2])
+        grade_value=grade1.number_input("Grade",min_value=0.0,max_value=100.0,value=0.0,step=1.0,key="bb_grade")
+        points_possible=grade2.number_input("Points Possible",min_value=1.0,max_value=1000.0,value=100.0,step=1.0,key="bb_points")
+        include_grade=grade3.checkbox(
+            "Include this grade in the gradebook / report-card average",
+            value=False,key="bb_include_grade"
         )
 
-    if cloud_configured():
-        if st.button("☁️ Sync Database Now",use_container_width=True,key="sync_db_now_v4"):
-            if cloud_upload_file(DB):
-                st.session_state.pop("_cloud_sync_error",None)
-                st.success("Database synced to private cloud storage.")
+        if st.button("✨ Generate Bulletin Board Feedback",key="bb_generate"):
+            parts=[f"Great job, {scholar_name}!"]
+            if glow1.strip():
+                parts.append(glow1.strip().rstrip(".")+"." )
+            if glow2.strip():
+                parts.append(glow2.strip().rstrip(".")+"." )
+            if grow.strip():
+                parts.append("Next time, "+grow.strip()[0].lower()+grow.strip()[1:] if len(grow.strip())>1 else "Next time, "+grow.strip())
+            feedback=" ".join(parts)
+            st.session_state["bb_feedback"]=feedback
+
+        feedback=st.text_area(
+            "Editable feedback for the scholar",
+            value=st.session_state.get("bb_feedback",""),
+            height=155,key="bb_feedback_editor"
+        )
+
+        st.markdown("### Display Information")
+        d1,d2=st.columns(2)
+        with d1:
+            st.text_area("Task to display",value=task,height=100,key="bb_task_display")
+            st.text_area("Vocabulary to display",value=vocab,height=80,key="bb_vocab_display")
+        with d2:
+            st.text_area("Standards to display",value=standards,height=80,key="bb_standards_display")
+            st.caption("These fields are editable so you can clean up wording before printing or copying.")
+
+        if st.button("💾 Save Bulletin Board Entry",type="primary",key="bb_save"):
+            if not title.strip():
+                st.warning("Add a display / assignment title first.")
             else:
-                st.error("Cloud sync did not complete. Check your Supabase secrets and bucket.")
+                file_name=""
+                file_path=""
+                if work is not None:
+                    safe=datetime.now().strftime("%Y%m%d_%H%M%S_")+re.sub(r'[^A-Za-z0-9._-]','_',work.name)
+                    folderp=UPLOAD_DIR/f"bulletin_board/{sid}"
+                    folderp.mkdir(parents=True,exist_ok=True)
+                    dest=folderp/safe
+                    dest.write_bytes(work.getbuffer())
+                    file_name=work.name
+                    file_path=str(dest)
 
-    st.markdown("### Restore / Migrate Existing ChapLab Data")
-    st.caption(
-        "Use this once after deploying the web app if you want to move your current personal-computer database into the web version."
-    )
-    restore=st.file_uploader(
-        "Upload an existing teacher_tracker.db or backup .db file",
-        type=["db","sqlite","sqlite3"],
-        key="restore_chaplab_db_v4"
-    )
-    confirm_restore=st.checkbox(
-        "I understand this will replace the database currently being used by this ChapLab installation.",
-        key="confirm_restore_db_v4"
-    )
-    if st.button(
-        "Restore Uploaded Database",
-        disabled=(restore is None or not confirm_restore),
-        use_container_width=True,
-        key="restore_db_button_v4"
-    ):
-        raw=bytes(restore.getbuffer())
-        tmp_path=Path(tempfile.gettempdir())/"chaplab_restore_check.db"
-        tmp_path.write_bytes(raw)
-        try:
-            check=sqlite3.connect(str(tmp_path))
-            result=check.execute("PRAGMA integrity_check").fetchone()[0]
-            tables={r[0] for r in check.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-            check.close()
-            if str(result).lower()!="ok":
-                raise ValueError("SQLite integrity check did not pass.")
-            if "scholars" not in tables or "settings" not in tables:
-                raise ValueError("This does not appear to be a ChapLab database.")
-            Path(DB).write_bytes(raw)
-            if cloud_configured() and not cloud_upload_file(DB):
-                raise RuntimeError("Database restored locally, but cloud upload failed.")
-            st.cache_resource.clear()
-            st.success("Database restored. ChapLab will reload with the migrated data.")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Could not restore this database: {e}")
+                assignment_id=None
+                if include_grade:
+                    c=conn()
+                    existing=c.execute(
+                        """SELECT id FROM assignments
+                           WHERE class_id=? AND title=? AND subject=? ORDER BY id DESC LIMIT 1""",
+                        (int(selected_class) if selected_class else None,title.strip(),subject)
+                    ).fetchone()
+                    if existing:
+                        assignment_id=int(existing["id"])
+                    else:
+                        cur=c.execute(
+                            """INSERT INTO assignments(title,subject,category,standard_code,points_possible,assignment_date,class_id,marking_period,include_in_average)
+                               VALUES (?,?,?,?,?,?,?,?,1)""",
+                            (title.strip(),subject,"Classwork",standards.split(",")[0].strip() if standards else "",
+                             float(points_possible),str(date.today()),int(selected_class) if selected_class else None,
+                             quarter_for_date(str(date.today()),current_academic_year()) or "Quarter 1")
+                        )
+                        assignment_id=int(cur.lastrowid)
+                    earned=(float(grade_value)/100.0)*float(points_possible)
+                    c.execute("INSERT OR REPLACE INTO grades(scholar_id,assignment_id,points_earned) VALUES (?,?,?)",
+                              (int(sid),assignment_id,earned))
+                    c.commit(); c.close()
 
-    if auth_config():
-        st.markdown("### Session")
-        if st.button("Sign Out",key="chaplab_signout_v4"):
-            st.session_state["chaplab_authenticated"]=False
-            st.rerun()
+                c=conn()
+                c.execute("""INSERT INTO bulletin_board_work(
+                    scholar_id,created_at,title,subject,task_text,vocabulary,standards,rubric_text,
+                    work_file_name,work_file_path,glow_1,glow_2,grow,final_feedback,
+                    grade_value,points_possible,include_in_gradebook,assignment_id)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (int(sid),datetime.now().isoformat(timespec="minutes"),title.strip(),subject,
+                     task,vocab,standards,rubric,file_name,file_path,glow1,glow2,grow,feedback,
+                     float(grade_value),float(points_possible),1 if include_grade else 0,assignment_id))
+                c.commit(); c.close()
+                st.success("Bulletin Board entry saved." + (" Grade added to the gradebook." if include_grade else " Grade kept out of the report-card average."))
+                st.rerun()
 
-    st.markdown("### Important")
-    st.warning(
-        "ChapLab Web is designed for one teacher account at a time. Avoid editing from two devices at the exact same time. "
-        "For student information, use only cloud services approved by your school or organization."
-    )
+        st.markdown("---")
+        st.markdown("### Saved Bulletin Board Work")
+        c=conn()
+        saved=pd.read_sql_query(
+            """SELECT b.id,b.created_at,b.title,b.subject,b.grade_value,b.include_in_gradebook,
+                      b.final_feedback,s.first_name||' '||s.last_name scholar
+               FROM bulletin_board_work b
+               LEFT JOIN scholars s ON s.id=b.scholar_id
+               WHERE b.scholar_id=?
+               ORDER BY b.id DESC""",c,params=[int(sid)]
+        )
+        c.close()
+        if saved.empty:
+            st.caption("No Bulletin Board entries saved for this scholar yet.")
+        else:
+            show=saved.copy()
+            show["Counts in Gradebook"]=show["include_in_gradebook"].map(lambda x:"Yes" if x else "No")
+            st.dataframe(show[["created_at","title","subject","grade_value","Counts in Gradebook","final_feedback"]],
+                         hide_index=True,use_container_width=True)
 
 elif page=="Communication Log":
     st.markdown('<div class="page-title">Communication Log</div><div class="page-subtitle">Track family contacts and follow-up notes.</div>',unsafe_allow_html=True)
