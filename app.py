@@ -48,7 +48,7 @@ def cloud_config():
     return {"url":url,"key":key,"bucket":bucket,"db_object":db_object}
 
 def auth_config():
-    cfg=_secret_section("auth")
+    cfg=_secret_section("chaplab_auth")
     if not cfg:
         return None
     username=str(cfg.get("username","")).strip()
@@ -64,7 +64,7 @@ def require_login():
     auth=auth_config()
     if cloud_configured() and not auth:
         st.error("ChapLab Web is connected to cloud storage, but login credentials are missing.")
-        st.info("Add an [auth] section to Streamlit Secrets before using student data online.")
+        st.info("Add a [chaplab_auth] section to Streamlit Secrets before using student data online.")
         st.stop()
 
     # Local mode remains available without a login.
@@ -2118,24 +2118,6 @@ if home_action:
             st.session_state["show_quarter_settings"]=True
     st.query_params.clear()
 
-
-if side_action:
-    side_map={
-        "main":"Home Page",
-        "scholars":"Scholars",
-        "grades":"Scholar Binder",
-        "books":"Book Leveler",
-        "grouping":"Student Grouping",
-        "reports":"Report Card Comments",
-        "assistant":"Little Assistant",
-        "communication":"Communication Log",
-        "web":"Web & Backup",
-    }
-    st.session_state["nav_page"]=side_map.get(side_action,"Home Page")
-    if side_action=="grades":
-        st.session_state["class_binder_tool"]="Overview"
-    st.query_params.clear()
-
 quick=st.query_params.get("binder")
 if quick:
     quick_map={
@@ -2153,9 +2135,6 @@ if quick:
         if bt: st.session_state["class_binder_tool"]=bt
         if at: st.session_state["assistant_tool"]=at
     st.query_params.clear()
-
-if st.session_state.get("chaplab_authenticated"):
-    st.session_state["chaplab_last_activity"]=time.time()
 
 page=st.session_state["nav_page"]
 
@@ -2188,28 +2167,24 @@ nav_items=[
     ("⚙️","Web & Backup","Web & Backup"),
 ]
 
-def _native_nav_click(target):
+def _chaplab_nav_to(target):
     st.session_state["nav_page"]=target
     if target=="Scholar Binder":
         st.session_state["class_binder_tool"]="Overview"
 
 with st.sidebar:
-    st.markdown(f"### {teacher}’s Teacher Hub")
-    st.caption("Navigation")
+    st.markdown(f"### {teacher}’s Teacher Hub ♡")
     for icon,label,target in nav_items:
-        button_type="primary" if page==target else "secondary"
         if st.button(
             f"{icon} {label}",
-            key=f"nav_{target}",
+            key=f"chaplab_nav_{target}",
             use_container_width=True,
-            type=button_type
+            type="primary" if page==target else "secondary"
         ):
-            _native_nav_click(target)
+            _chaplab_nav_to(target)
             st.rerun()
-
     st.markdown("---")
     st.caption(f"☁️ {cloud_status_text()}")
-
 st.markdown("**Classes**")
 if records:
     class_cols=st.columns(len(records))
@@ -2219,7 +2194,7 @@ if records:
         with col:
             if st.button(
                 cname,
-                key=f"class_nav_{cid}",
+                key=f"chaplab_class_{cid}",
                 use_container_width=True,
                 type="primary" if cid==selected_class else "secondary"
             ):
