@@ -2118,20 +2118,6 @@ if home_action:
             st.session_state["show_quarter_settings"]=True
     st.query_params.clear()
 
-side_action=st.query_params.get("side")
-class_action=st.query_params.get("class")
-if class_action:
-    try:
-        class_id=int(class_action)
-        valid_ids=set(classes_df()["id"].astype(int).tolist())
-        if class_id in valid_ids:
-            st.session_state["selected_class"]=class_id
-            selected_class=class_id
-            st.session_state["nav_page"]="Class Dashboard"
-            st.session_state["class_binder_tool"]="Overview"
-    except Exception:
-        pass
-    st.query_params.clear()
 
 if side_action:
     side_map={
@@ -2168,6 +2154,9 @@ if quick:
         if at: st.session_state["assistant_tool"]=at
     st.query_params.clear()
 
+if st.session_state.get("chaplab_authenticated"):
+    st.session_state["chaplab_last_activity"]=time.time()
+
 page=st.session_state["nav_page"]
 
 teacher=get_teacher_name() or "Ms. Chapman"
@@ -2188,40 +2177,56 @@ teacher=get_teacher_name() or "Ms. Chapman"
 initials="".join([p[0] for p in teacher.replace(".","").split() if p])[:2].upper() or "MC"
 
 nav_items=[
-    ("🏠","Main Dashboard","Home Page","main"),
-    ("🎓","Scholars","Scholars","scholars"),
-    ("Ⓐ","Grades","Scholar Binder","grades"),
-    ("📚","Book Leveler","Book Leveler","books"),
-    ("👥","Student Grouping","Student Grouping","grouping"),
-    ("📝","Report Card Comments","Report Card Comments","reports"),
-    ("✨","Little Assistant","Little Assistant","assistant"),
-    ("💬","Communication Log","Communication Log","communication"),
-    ("⚙️","Web & Backup","Web & Backup","web"),
+    ("🏠","Main Dashboard","Home Page"),
+    ("🎓","Scholars","Scholars"),
+    ("Ⓐ","Grades","Scholar Binder"),
+    ("📚","Book Leveler","Book Leveler"),
+    ("👥","Student Grouping","Student Grouping"),
+    ("📝","Report Card Comments","Report Card Comments"),
+    ("✨","Little Assistant","Little Assistant"),
+    ("💬","Communication Log","Communication Log"),
+    ("⚙️","Web & Backup","Web & Backup"),
 ]
-nav_links=[]
-for icon,label,target,query in nav_items:
-    active=" active" if page==target else ""
-    nav_links.append(f'<a class="nav-link{active}" href="?side={query}"><span>{icon}</span>{html.escape(label)}</a>')
 
-sidebar_html=f"""
-<div class="teacher-sidebar">
-  <div class="teacher-avatar">{initials}</div>
-  <div class="teacher-brand">{html.escape(teacher)}’s<br>Teacher Hub ♡</div>
-  {''.join(nav_links)}
-  <div class="sidebar-note">⭐ <b>Every scholar.<br>Every day.<br>Just growth.</b><br><br>☁️ {html.escape(cloud_status_text())}</div>
-</div>
-"""
-if hasattr(st,"html"): st.html(textwrap.dedent(sidebar_html).strip())
-else: st.markdown("\\n".join(line.lstrip() for line in textwrap.dedent(sidebar_html).splitlines()),unsafe_allow_html=True)
+def _native_nav_click(target):
+    st.session_state["nav_page"]=target
+    if target=="Scholar Binder":
+        st.session_state["class_binder_tool"]="Overview"
 
-class_links=['<span class="class-bar-label">Classes:</span>']
-for item in records:
-    cid=int(item["id"]); cname=item["class_name"]
-    active=" active" if cid==selected_class else ""
-    class_links.append(f'<a class="class-pill{active}" href="?class={cid}">{html.escape(cname)}</a>')
-classbar_html=f'<div class="class-bar">{"".join(class_links)}</div>'
-if hasattr(st,"html"): st.html(classbar_html)
-else: st.markdown(classbar_html,unsafe_allow_html=True)
+with st.sidebar:
+    st.markdown(f"### {teacher}’s Teacher Hub")
+    st.caption("Navigation")
+    for icon,label,target in nav_items:
+        button_type="primary" if page==target else "secondary"
+        if st.button(
+            f"{icon} {label}",
+            key=f"nav_{target}",
+            use_container_width=True,
+            type=button_type
+        ):
+            _native_nav_click(target)
+            st.rerun()
+
+    st.markdown("---")
+    st.caption(f"☁️ {cloud_status_text()}")
+
+st.markdown("**Classes**")
+if records:
+    class_cols=st.columns(len(records))
+    for col,item in zip(class_cols,records):
+        cid=int(item["id"])
+        cname=item["class_name"]
+        with col:
+            if st.button(
+                cname,
+                key=f"class_nav_{cid}",
+                use_container_width=True,
+                type="primary" if cid==selected_class else "secondary"
+            ):
+                st.session_state["selected_class"]=cid
+                st.session_state["nav_page"]="Class Dashboard"
+                st.session_state["class_binder_tool"]="Overview"
+                st.rerun()
 
 # ---------- Pages ----------
 if page=="Home Page":
