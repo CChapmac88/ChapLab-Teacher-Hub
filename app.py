@@ -14,6 +14,11 @@ import textwrap
 import requests
 
 try:
+    from pypdf import PdfReader
+except Exception:
+    PdfReader=None
+
+try:
     from supabase import create_client
 except Exception:
     create_client=None
@@ -606,6 +611,84 @@ def init_db():
     addcol(cur,"benchmark_scores","nwea_winter_math","TEXT DEFAULT ''")
     addcol(cur,"benchmark_scores","nwea_reading_goal","TEXT DEFAULT ''")
     addcol(cur,"benchmark_scores","nwea_math_goal","TEXT DEFAULT ''")
+    addcol(cur,"benchmark_scores","fp_winter_level","TEXT DEFAULT ''")
+    addcol(cur,"benchmark_scores","fp_winter_word_list","TEXT DEFAULT ''")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS iready_scores(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scholar_id INTEGER NOT NULL UNIQUE,
+            fall_reading TEXT DEFAULT '',
+            winter_reading TEXT DEFAULT '',
+            spring_reading TEXT DEFAULT '',
+            reading_goal TEXT DEFAULT '',
+            fall_math TEXT DEFAULT '',
+            winter_math TEXT DEFAULT '',
+            spring_math TEXT DEFAULT '',
+            math_goal TEXT DEFAULT '',
+            notes TEXT DEFAULT ''
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS interim_assessments(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            class_id INTEGER,
+            subject TEXT NOT NULL,
+            interim_number INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            assessment_date TEXT DEFAULT '',
+            source_file TEXT DEFAULT '',
+            assignment_id INTEGER,
+            imported_at TEXT NOT NULL,
+            UNIQUE(class_id,subject,interim_number)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS interim_results(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            assessment_id INTEGER NOT NULL,
+            scholar_id INTEGER NOT NULL,
+            school_student_id TEXT DEFAULT '',
+            overall_score REAL,
+            mc_earned REAL, mc_possible REAL,
+            cr_earned REAL, cr_possible REAL,
+            raw_text TEXT DEFAULT '',
+            UNIQUE(assessment_id,scholar_id)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS interim_standard_scores(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            assessment_id INTEGER NOT NULL,
+            scholar_id INTEGER NOT NULL,
+            standard_code TEXT NOT NULL,
+            standard_text TEXT DEFAULT '',
+            question_numbers TEXT DEFAULT '',
+            standard_score REAL,
+            UNIQUE(assessment_id,scholar_id,standard_code)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS interim_question_results(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            assessment_id INTEGER NOT NULL,
+            scholar_id INTEGER NOT NULL,
+            question_number INTEGER NOT NULL,
+            response TEXT DEFAULT '',
+            correct_answer TEXT DEFAULT '',
+            earned REAL, possible REAL,
+            UNIQUE(assessment_id,scholar_id,question_number)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS interim_goals(
+            class_id INTEGER NOT NULL,
+            subject TEXT NOT NULL,
+            interim_number INTEGER NOT NULL,
+            proficiency_goal REAL,
+            notes TEXT DEFAULT '',
+            PRIMARY KEY(class_id,subject,interim_number)
+        )
+    """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS book_catalog(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2165,6 +2248,685 @@ def fp_level_relation(student_level, book_level):
         return ("Slightly above current level",diff)
     return ("Above current level",diff)
 
+
+
+# ---------- Interim Assessment Import / Analysis ----------
+def _norm_person_name(s):
+    s=re.sub(r"[^A-Za-z0-9 ]+"," ",str(s or "").lower())
+    return " ".join(s.split())
+
+def _roster_name_keys(row):
+    first=str(row.get("first_name","") or "").strip()
+    last=str(row.get("last_name","") or "").strip()
+    return {
+        _norm_person_name(f"{first} {last}"),
+        _norm_person_name(f"{last} {first}"),
+        _norm_person_name(f"{last}, {first}"),
+    }
+
+def parse_interim_pdf(uploaded_file):
+    if PdfReader is None:
+        raise RuntimeError("PDF reader is not installed yet. Redeploy after adding pypdf to requirements.txt.")
+    data=bytes(uploaded_file.getbuffer())
+    reader=PdfReader(BytesIO(data))
+    parsed=[]
+    for page_num,page in enumerate(reader.pages,1):
+        raw=page.extract_text() or ""
+        if not raw.strip():
+            continue
+        flat=re.sub(r"[ \t]+"," ",raw)
+        title_match=re.search(r"(?im)^\s*(\d+)\s+(ELA|MATH)\s+NY\s+INTERIM\s+(\d+)",raw)
+        score_match=re.search(r"(?im)^\s*Score\s+([0-4](?:\.\d+)?)\s*$",raw)
+        mc_match=re.search(r"Multiple Choice\s*:?\s*(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)",raw,re.I)
+        cr_match=re.search(r"Constructed Response\s*:?\s*(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)",raw,re.I)
+        date_match=re.search(r"Assessment Date\s*:\s*([0-9/\-]+)",raw,re.I)
+        person_match=re.search(r"Assessment Date\s*:\s*[0-9/\-]+\s*\n\s*([^\n]+?)\s*\((\d+)\)",raw,re.I)
+        if not person_match:
+            person_match=re.search(r"Assessment Date\s*:\s*[0-9/\-]+\s+(.+?)\s*\((\d+)\)\s*Q\s*1",flat,re.I|re.S)
+        if not score_match or not person_match:
+            continue
+        name=person_match.group(1).strip()
+        student_id=person_match.group(2).strip()
+        subject=(title_match.group(2).upper() if title_match else "").replace("MATH","Math").replace("ELA","ELA")
+        interim_no=int(title_match.group(3)) if title_match else None
+
+        questions=[]
+        for m in re.finditer(r"Q\s*(\d+)\s*:\s*([A-D\-])\s*\(([A-D])\)",raw,re.I):
+            q=int(m.group(1)); resp=m.group(2).upper(); correct=m.group(3).upper()
+            questions.append({"question_number":q,"response":resp,"correct_answer":correct,"earned":1.0 if resp==correct else 0.0,"possible":1.0})
+        for m in re.finditer(r"Q\s*(\d+)\s*:\s*(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)",raw,re.I):
+            questions.append({"question_number":int(m.group(1)),"response":m.group(2),"correct_answer":"","earned":float(m.group(2)),"possible":float(m.group(3))})
+        # Deduplicate by question number.
+        qmap={q["question_number"]:q for q in questions}
+        questions=[qmap[k] for k in sorted(qmap)]
+
+        standards=[]
+        if "STANDARD SUMMARY" in raw.upper():
+            std_part=re.split(r"STANDARD SUMMARY",raw,flags=re.I,maxsplit=1)[1]
+            starts=list(re.finditer(r"(?m)^\s*(\d+[A-Z]\d+)\s+",std_part))
+            for i,m in enumerate(starts):
+                code=m.group(1).strip()
+                seg=std_part[m.end(): starts[i+1].start() if i+1<len(starts) else len(std_part)]
+                normalized=" ".join(seg.split())
+                tail=re.search(r"((?:\d{1,2}\s*,\s*)*\d{1,2})\s+([0-4](?:\.\d+)?)\s*$",normalized)
+                if not tail:
+                    continue
+                qnums=tail.group(1).strip()
+                std_score=float(tail.group(2))
+                desc=normalized[:tail.start()].strip()
+                standards.append({"standard_code":code,"standard_text":desc,"question_numbers":qnums,"standard_score":std_score})
+
+        parsed.append({
+            "page":page_num,"name":name,"student_id":student_id,"subject":subject,"interim_number":interim_no,
+            "assessment_date":date_match.group(1) if date_match else "","overall_score":float(score_match.group(1)),
+            "mc_earned":float(mc_match.group(1)) if mc_match else None,"mc_possible":float(mc_match.group(2)) if mc_match else None,
+            "cr_earned":float(cr_match.group(1)) if cr_match else None,"cr_possible":float(cr_match.group(2)) if cr_match else None,
+            "questions":questions,"standards":standards,"raw_text":raw
+        })
+    return parsed
+
+def match_interim_results_to_roster(parsed, roster):
+    by_id={str(r.get("student_id","") or "").strip():int(r.id) for _,r in roster.iterrows() if str(r.get("student_id","") or "").strip()}
+    name_map={}
+    for _,r in roster.iterrows():
+        for key in _roster_name_keys(r):
+            name_map.setdefault(key,int(r.id))
+    rows=[]
+    for item in parsed:
+        sid=by_id.get(item["student_id"])
+        method="School ID" if sid else ""
+        if not sid:
+            key=_norm_person_name(item["name"].replace(","," "))
+            sid=name_map.get(key)
+            if sid: method="Name"
+        row=dict(item)
+        row["scholar_id"]=sid
+        row["match_method"]=method if sid else "Unmatched"
+        rows.append(row)
+    return rows
+
+def _ensure_interim_assignment(class_id,subject,interim_number,assessment_date):
+    title=f"{subject} Interim {interim_number}"
+    c=conn()
+    r=c.execute("SELECT id FROM assignments WHERE class_id=? AND subject=? AND title=? ORDER BY id DESC LIMIT 1",(int(class_id),subject,title)).fetchone()
+    if r:
+        aid=int(r["id"])
+    else:
+        mp=quarter_for_date(assessment_date,current_academic_year()) or "Quarter 1"
+        cur=c.execute("""INSERT INTO assignments(title,subject,category,standard_code,points_possible,assignment_date,class_id,marking_period)
+                         VALUES (?,?,?,?,?,?,?,?)""",(title,subject,"Assessment","",4.0,assessment_date or str(date.today()),int(class_id),mp))
+        aid=int(cur.lastrowid)
+    c.commit(); c.close(); return aid
+
+def save_interim_import(class_id,subject,interim_number,source_file,matched_rows):
+    valid=[r for r in matched_rows if r.get("scholar_id")]
+    if not valid:
+        return 0,0,None
+    assessment_date=next((r.get("assessment_date") for r in valid if r.get("assessment_date")),str(date.today()))
+    aid=_ensure_interim_assignment(class_id,subject,interim_number,assessment_date)
+    c=conn()
+    c.execute("""INSERT INTO interim_assessments(class_id,subject,interim_number,title,assessment_date,source_file,assignment_id,imported_at)
+                 VALUES (?,?,?,?,?,?,?,?)
+                 ON CONFLICT(class_id,subject,interim_number) DO UPDATE SET
+                 title=excluded.title,assessment_date=excluded.assessment_date,source_file=excluded.source_file,
+                 assignment_id=excluded.assignment_id,imported_at=excluded.imported_at""",
+              (int(class_id),subject,int(interim_number),f"{subject} Interim {interim_number}",assessment_date,source_file,aid,datetime.now().isoformat(timespec="seconds")))
+    assessment_id=int(c.execute("SELECT id FROM interim_assessments WHERE class_id=? AND subject=? AND interim_number=?",(int(class_id),subject,int(interim_number))).fetchone()["id"])
+    saved=0; skipped=0
+    for r in matched_rows:
+        sid=r.get("scholar_id")
+        if not sid:
+            skipped+=1; continue
+        c.execute("""INSERT INTO interim_results(assessment_id,scholar_id,school_student_id,overall_score,mc_earned,mc_possible,cr_earned,cr_possible,raw_text)
+                     VALUES (?,?,?,?,?,?,?,?,?)
+                     ON CONFLICT(assessment_id,scholar_id) DO UPDATE SET
+                     school_student_id=excluded.school_student_id,overall_score=excluded.overall_score,
+                     mc_earned=excluded.mc_earned,mc_possible=excluded.mc_possible,cr_earned=excluded.cr_earned,
+                     cr_possible=excluded.cr_possible,raw_text=excluded.raw_text""",
+                  (assessment_id,int(sid),r.get("student_id",""),r.get("overall_score"),r.get("mc_earned"),r.get("mc_possible"),r.get("cr_earned"),r.get("cr_possible"),r.get("raw_text","")))
+        c.execute("DELETE FROM interim_standard_scores WHERE assessment_id=? AND scholar_id=?",(assessment_id,int(sid)))
+        for s in r.get("standards",[]):
+            c.execute("""INSERT OR REPLACE INTO interim_standard_scores(assessment_id,scholar_id,standard_code,standard_text,question_numbers,standard_score)
+                         VALUES (?,?,?,?,?,?)""",(assessment_id,int(sid),s.get("standard_code",""),s.get("standard_text",""),s.get("question_numbers",""),s.get("standard_score")))
+        c.execute("DELETE FROM interim_question_results WHERE assessment_id=? AND scholar_id=?",(assessment_id,int(sid)))
+        for q in r.get("questions",[]):
+            c.execute("""INSERT OR REPLACE INTO interim_question_results(assessment_id,scholar_id,question_number,response,correct_answer,earned,possible)
+                         VALUES (?,?,?,?,?,?,?)""",(assessment_id,int(sid),int(q["question_number"]),q.get("response",""),q.get("correct_answer",""),q.get("earned"),q.get("possible")))
+        c.execute("""INSERT INTO grades(scholar_id,assignment_id,points_earned) VALUES (?,?,?)
+                     ON CONFLICT(scholar_id,assignment_id) DO UPDATE SET points_earned=excluded.points_earned""",(int(sid),aid,float(r.get("overall_score") or 0)))
+        saved+=1
+    c.commit(); c.close()
+    return saved,skipped,assessment_id
+
+def interim_assessment_record(class_id,subject,interim_number):
+    if not class_id: return None
+    c=conn(); r=c.execute("SELECT * FROM interim_assessments WHERE class_id=? AND subject=? AND interim_number=?",(int(class_id),subject,int(interim_number))).fetchone(); c.close(); return r
+
+def interim_results_df(assessment_id):
+    if not assessment_id: return pd.DataFrame()
+    c=conn(); df=pd.read_sql_query("""SELECT r.*,s.first_name,s.last_name FROM interim_results r
+                                      JOIN scholars s ON s.id=r.scholar_id WHERE r.assessment_id=? ORDER BY s.last_name,s.first_name""",c,params=[int(assessment_id)]); c.close()
+    if not df.empty: df["Scholar"]=df["first_name"].fillna("")+" "+df["last_name"].fillna("")
+    return df
+
+def interim_standard_summary_df(assessment_id):
+    if not assessment_id: return pd.DataFrame()
+    c=conn(); df=pd.read_sql_query("SELECT * FROM interim_standard_scores WHERE assessment_id=?",c,params=[int(assessment_id)]); c.close()
+    if df.empty: return pd.DataFrame()
+    rows=[]
+    for code,g in df.groupby("standard_code"):
+        vals=pd.to_numeric(g["standard_score"],errors="coerce").dropna()
+        if vals.empty: continue
+        textv=str(g.iloc[0]["standard_text"] or "")
+        qnums=str(g.iloc[0]["question_numbers"] or "")
+        prof=float((vals>=3.0).mean()*100)
+        below=float((vals<3.0).mean()*100)
+        rows.append({"Standard":code,"Standard Text":textv,"Question #s":qnums,"Average":round(vals.mean(),2),"% 3.0+":round(prof,1),"% Below 3.0":round(below,1),"N":len(vals)})
+    return pd.DataFrame(rows).sort_values(["% Below 3.0","Average"],ascending=[False,True]) if rows else pd.DataFrame()
+
+def interim_question_summary_df(assessment_id):
+    if not assessment_id: return pd.DataFrame()
+    c=conn(); df=pd.read_sql_query("SELECT * FROM interim_question_results WHERE assessment_id=?",c,params=[int(assessment_id)]); c.close()
+    if df.empty: return pd.DataFrame()
+    rows=[]
+    for q,g in df.groupby("question_number"):
+        earned=pd.to_numeric(g["earned"],errors="coerce"); possible=pd.to_numeric(g["possible"],errors="coerce")
+        pct=(earned.sum()/possible.sum()*100) if possible.sum()>0 else None
+        rows.append({"Question":int(q),"% Earned":round(pct,1) if pct is not None else None,"N":len(g)})
+    return pd.DataFrame(rows).sort_values("Question")
+
+def interim_potential_risers(results):
+    if results.empty: return []
+    vals=pd.to_numeric(results["overall_score"],errors="coerce")
+    return results[(vals-2.5).abs()<0.001]["Scholar"].tolist()
+
+def interim_proficiency(results):
+    if results.empty: return None
+    vals=pd.to_numeric(results["overall_score"],errors="coerce").dropna()
+    return float((vals>=3.0).mean()*100) if not vals.empty else None
+
+def get_interim_goal(class_id,subject,interim_number):
+    if not class_id: return None
+    c=conn(); r=c.execute("SELECT proficiency_goal FROM interim_goals WHERE class_id=? AND subject=? AND interim_number=?",(int(class_id),subject,int(interim_number))).fetchone(); c.close()
+    return float(r["proficiency_goal"]) if r and r["proficiency_goal"] is not None else None
+
+def save_interim_goal(class_id,subject,interim_number,goal):
+    c=conn(); c.execute("""INSERT INTO interim_goals(class_id,subject,interim_number,proficiency_goal) VALUES (?,?,?,?)
+                         ON CONFLICT(class_id,subject,interim_number) DO UPDATE SET proficiency_goal=excluded.proficiency_goal""",(int(class_id),subject,int(interim_number),float(goal))); c.commit(); c.close()
+
+def interim_copy_blocks(class_id,subject,interim_number,assessment_id):
+    cname=class_name_from_id(class_id) or "Class"
+    results=interim_results_df(assessment_id)
+    std=interim_standard_summary_df(assessment_id)
+    qdf=interim_question_summary_df(assessment_id)
+    prof=interim_proficiency(results)
+    risers=interim_potential_risers(results)
+    next_no=min(3,int(interim_number)+1)
+    next_goal=get_interim_goal(class_id,subject,next_no)
+    goal_text=(f"{next_goal:.0f}%" if next_goal is not None else "[enter next interim goal]")
+    goals=(f"{cname} | {subject} Interim {interim_number}\n"
+           f"Proficiency % (3.0/B and above): {prof:.0f}%\n" if prof is not None else f"{cname} | {subject} Interim {interim_number}\nProficiency %: No data\n")
+    goals+=f"Potential Risers 2.5 (C): {', '.join(risers) if risers else 'None'}\n"
+    if interim_number<3: goals+=f"Interim {next_no} {subject} Goal: {goal_text}\n"
+
+    strengths=std[std["% 3.0+"]>=70] if not std.empty else pd.DataFrame()
+    reteach=std[std["% Below 3.0"]>=60] if not std.empty else pd.DataFrame()
+    sec1_strength="; ".join([f"{r.Standard} ({r['% 3.0+']:.0f}% at 3.0+)" for _,r in strengths.iterrows()]) or "No standard met the 70% strength threshold."
+    sec1_growth="; ".join([f"{r.Standard} ({r['% Below 3.0']:.0f}% below 3.0)" for _,r in reteach.iterrows()]) or "No standard met the 60% whole-group reteach threshold."
+    lines=["SECTION I: HIGH-LEVEL OBSERVATION",f"{cname} Strengths: {sec1_strength}",f"{cname} Growth Areas: {sec1_growth}","", "SECTION 2: WHOLE GROUP RETEACH"]
+    for _,r in reteach.iterrows():
+        desc=str(r["Standard Text"] or "").strip()
+        why=f"Scholars need additional practice with {desc[:220] if desc else r.Standard}."
+        plan=f"Model the skill with a think-aloud, underline/key evidence, complete guided practice, then spiral {r.Standard} in Do Now/weekly review and small groups."
+        lines += [f"Standard: {r.Standard}",f"Question #s: {r['Question #s']}",f"Why did students struggle?: {why}",f"Instructional Plan: {plan}",""]
+    if reteach.empty: lines.append("No standard currently meets the 60% below-3.0 whole-group reteach rule.\n")
+
+    # Individual major concerns = below 2.5 overall; include their weakest standards.
+    lines += ["SECTION 3: INDIVIDUAL / SMALL GROUP REVIEW"]
+    if not results.empty:
+        low=results[pd.to_numeric(results["overall_score"],errors="coerce")<2.5]
+        if low.empty:
+            lines.append("Students of Major Concern: None below 2.5 overall.")
+        else:
+            c=conn()
+            for _,rr in low.iterrows():
+                weak=pd.read_sql_query("""SELECT standard_code,standard_score FROM interim_standard_scores
+                                           WHERE assessment_id=? AND scholar_id=? AND standard_score<3 ORDER BY standard_score,standard_code""",c,params=[int(assessment_id),int(rr.scholar_id)])
+                weak_list=", ".join(weak.standard_code.head(5).tolist()) if not weak.empty else "Review overall assessment performance"
+                lines.append(f"{rr.Scholar}: score {float(rr.overall_score):g}; most help with {weak_list}; support during workshop/Do Now/small group.")
+            c.close()
+    lines += ["", "SECTION 4: DEFINING NEXT STEPS — SPIRAL REVIEW"]
+    if not std.empty:
+        for i,(_,r) in enumerate(std.head(4).iterrows(),1):
+            lines.append(f"Week {i} Standards for Review: {r.Standard} — {str(r['Standard Text'])[:180]}")
+            lines.append(f"Week {i} New Standards: [teacher enters upcoming standard]")
+    else:
+        for i in range(1,5): lines.append(f"Week {i} Standards for Review: [data will populate after import]")
+    analysis="\n".join(lines)
+    return goals,analysis
+
+def render_interim_center(selected_scope_class=None):
+    st.markdown("## 📝 Interims")
+    st.caption("Upload the class interim PDF once. ChapLab reads each scholar page, saves the 0–4 overall score to Grades, keeps the standard/question data for analysis, and builds copy-ready text for the school goal and data-day documents.")
+    classes=classes_df()
+    if classes.empty:
+        st.info("The Interim workspace is ready. Add a class and roster before importing a PDF so ChapLab can match scholar names/IDs and send overall scores to Grades.")
+        c1,c2,c3=st.columns(3)
+        c1.selectbox("Class",["No classes yet"],disabled=True,key="interim_no_class")
+        c2.radio("Subject",["ELA","Math"],horizontal=True,key="interim_subject_empty")
+        c3.radio("Interim",[1,2,3],horizontal=True,key="interim_num_empty")
+        st.file_uploader("Upload interim results PDF",type=["pdf"],disabled=True,key="interim_pdf_empty")
+        st.markdown("### Goals & Potential Risers")
+        st.text_area("Copy into the Interim Goals document",value="Class proficiency, 2.5 potential risers, and next-interim goal will appear here.",height=130,disabled=True,key="interim_goals_empty")
+        st.markdown("### Assessment Analysis & Action Plan")
+        st.text_area("Copy into the Data Day Analysis document",value="Strengths, whole-group reteach standards, question numbers, major concerns, small-group needs, and four-week spiral standards will appear here.",height=260,disabled=True,key="interim_analysis_empty")
+        return
+
+    ids=list(classes.id.astype(int))
+    default=selected_scope_class if selected_scope_class in ids else ids[0]
+    top1,top2,top3=st.columns([2,1,1])
+    class_id=top1.selectbox("Class",ids,index=ids.index(default),format_func=lambda x:classes[classes.id==x].iloc[0].class_name,key="interim_class")
+    subject=top2.radio("Subject",["ELA","Math"],horizontal=True,key="interim_subject")
+    interim_no=top3.radio("Interim",[1,2,3],horizontal=True,key="interim_number")
+
+    st.markdown("### Import PDF Results")
+    uploaded=st.file_uploader("Upload the class interim PDF",type=["pdf"],key="interim_pdf_upload")
+    if uploaded:
+        try:
+            parsed=parse_interim_pdf(uploaded)
+            roster=scholars_df(class_id)
+            matched=match_interim_results_to_roster(parsed,roster)
+            review=[]
+            for r in matched:
+                review.append({"Page":r["page"],"PDF Scholar":r["name"],"School ID":r["student_id"],"Match":r["match_method"],"Score":r["overall_score"],"MC":f"{_fmt_score(r['mc_earned'])}/{_fmt_score(r['mc_possible'])}","CR":f"{_fmt_score(r['cr_earned'])}/{_fmt_score(r['cr_possible'])}","Standards":len(r.get("standards",[]))})
+            st.dataframe(pd.DataFrame(review),hide_index=True,use_container_width=True)
+            unmatched=sum(1 for r in matched if not r.get("scholar_id"))
+            if unmatched: st.warning(f"{unmatched} PDF scholar page(s) are unmatched. Check the roster names/School IDs before saving.")
+            if st.button("Import Interim & Send Overall Scores to Grades",type="primary",key="save_interim_pdf"):
+                saved,skipped,assessment_id=save_interim_import(class_id,subject,interim_no,uploaded.name,matched)
+                st.success(f"Imported {saved} scholars. {skipped} unmatched/skipped. {subject} Interim {interim_no} overall scores were entered in Grades as points out of 4.")
+                st.session_state["last_interim_assessment_id"]=assessment_id
+                st.rerun()
+        except Exception as e:
+            st.error(f"Could not read the interim PDF: {e}")
+
+    rec=interim_assessment_record(class_id,subject,interim_no)
+    if not rec:
+        st.info(f"No saved {subject} Interim {interim_no} results yet. The analysis areas below will populate after you import the PDF.")
+        results=pd.DataFrame(); std=pd.DataFrame(); qdf=pd.DataFrame(); assessment_id=None
+    else:
+        assessment_id=int(rec["id"]); results=interim_results_df(assessment_id); std=interim_standard_summary_df(assessment_id); qdf=interim_question_summary_df(assessment_id)
+        st.markdown(f"### {subject} Interim {interim_no} Class Snapshot")
+        prof=interim_proficiency(results); risers=interim_potential_risers(results)
+        m1,m2,m3,m4=st.columns(4)
+        m1.metric("Scholars Imported",len(results))
+        m2.metric("Proficiency (3.0+)",f"{prof:.0f}%" if prof is not None else "—")
+        m3.metric("Potential Risers (2.5)",len(risers))
+        m4.metric("Class Avg Score",f"{pd.to_numeric(results['overall_score'],errors='coerce').mean():.2f}" if not results.empty else "—")
+        if risers: st.write("**Potential Risers:** "+", ".join(risers))
+        if not std.empty:
+            st.markdown("#### Standards Analysis")
+            st.dataframe(std,hide_index=True,use_container_width=True)
+        if not qdf.empty:
+            st.markdown("#### Question Analysis")
+            st.dataframe(qdf,hide_index=True,use_container_width=True)
+
+    if interim_no<3:
+        next_no=interim_no+1
+        existing_goal=get_interim_goal(class_id,subject,next_no)
+        goal=st.number_input(f"Interim {next_no} {subject} Proficiency Goal (%)",0.0,100.0,float(existing_goal) if existing_goal is not None else 50.0,1.0,key=f"goal_{subject}_{next_no}")
+        if st.button(f"Save Interim {next_no} Goal",key=f"save_goal_{subject}_{next_no}"):
+            save_interim_goal(class_id,subject,next_no,goal); st.success("Goal saved."); st.rerun()
+
+    goals,analysis=interim_copy_blocks(class_id,subject,interim_no,assessment_id) if assessment_id else (f"{class_name_from_id(class_id)} | {subject} Interim {interim_no}\nProficiency %: [imports will populate]\nPotential Risers 2.5 (C): [imports will populate]", "Import the interim PDF to generate the Assessment Analysis & Action Plan text.")
+    st.markdown("---")
+    st.markdown("### 📋 Copy/Paste for Required School Documents")
+    st.markdown("#### Interim 2 & 3 Goals Document")
+    st.text_area("Copy this into the Goals document",value=goals,height=170,key="interim_goals_copy")
+    st.markdown("#### Assessment Analysis & Action Plan")
+    st.text_area("Copy this into the Data Day Analysis document",value=analysis,height=520,key="interim_analysis_copy")
+# ---------- Assessment Data Center ----------
+def assessment_roster(class_id=None):
+    """Use selected class when available; otherwise use all active scholars."""
+    return scholars_df(class_id if class_id else None)
+
+def _safe_num(v):
+    try:
+        s=str(v or "").strip()
+        return float(s) if s else None
+    except:
+        return None
+
+def _fmt_score(v):
+    n=_safe_num(v)
+    if n is None:
+        return "—"
+    return f"{n:g}"
+
+def iready_for_scholar(sid):
+    c=conn()
+    r=c.execute("SELECT * FROM iready_scores WHERE scholar_id=?",(int(sid),)).fetchone()
+    c.close()
+    return r
+
+def assessment_scope_label(class_id):
+    if class_id:
+        name=class_name_from_id(int(class_id))
+        return name or "Selected class"
+    return "All scholars"
+
+def _assessment_subject_keys(prefix, subject):
+    side="reading" if subject=="Reading" else "math"
+    return (
+        f"{prefix}_fall_{side}" if prefix=="nwea" else f"fall_{side}",
+        f"{prefix}_winter_{side}" if prefix=="nwea" else f"winter_{side}",
+        f"{prefix}_spring_{side}" if prefix=="nwea" else f"spring_{side}",
+        f"{prefix}_{side}_goal" if prefix=="nwea" else f"{side}_goal"
+    )
+
+def nwea_scope_dataframe(class_id, subject):
+    roster=assessment_roster(class_id)
+    side="reading" if subject=="Reading" else "math"
+    rows=[]
+    for _,sr in roster.iterrows():
+        br=benchmark_for_scholar(int(sr.id))
+        fall=winter=spring=goal=None
+        if br:
+            fall=_safe_num(br[f"nwea_fall_{side}"]) if f"nwea_fall_{side}" in br.keys() else None
+            winter=_safe_num(br[f"nwea_winter_{side}"]) if f"nwea_winter_{side}" in br.keys() else None
+            spring=_safe_num(br[f"nwea_spring_{side}"]) if f"nwea_spring_{side}" in br.keys() else None
+            goal=_safe_num(br[f"nwea_{side}_goal"]) if f"nwea_{side}_goal" in br.keys() else None
+        latest=spring if spring is not None else winter if winter is not None else fall
+        growth=(spring-fall) if spring is not None and fall is not None else None
+        rows.append({"Scholar":nm(sr),"Fall":fall,"Winter":winter,"Spring":spring,"Goal":goal,"Latest":latest,"Growth":growth})
+    return pd.DataFrame(rows)
+
+def iready_scope_dataframe(class_id, subject):
+    roster=assessment_roster(class_id)
+    side="reading" if subject=="Reading" else "math"
+    rows=[]
+    for _,sr in roster.iterrows():
+        br=iready_for_scholar(int(sr.id))
+        fall=winter=spring=goal=None
+        if br:
+            fall=_safe_num(br[f"fall_{side}"])
+            winter=_safe_num(br[f"winter_{side}"])
+            spring=_safe_num(br[f"spring_{side}"])
+            goal=_safe_num(br[f"{side}_goal"])
+        latest=spring if spring is not None else winter if winter is not None else fall
+        growth=(spring-fall) if spring is not None and fall is not None else None
+        rows.append({"Scholar":nm(sr),"Fall":fall,"Winter":winter,"Spring":spring,"Goal":goal,"Latest":latest,"Growth":growth})
+    return pd.DataFrame(rows)
+
+def assessment_high_low_growth(df):
+    if df.empty:
+        return None,None,None
+    scored=df[df["Latest"].notna()]
+    high=low=None
+    if not scored.empty:
+        hi=scored["Latest"].max()
+        lo=scored["Latest"].min()
+        high=(scored[scored["Latest"]==hi]["Scholar"].tolist(),hi)
+        low=(scored[scored["Latest"]==lo]["Scholar"].tolist(),lo)
+    grew=df[df["Growth"].notna()]
+    growth=None
+    if not grew.empty:
+        mx=grew["Growth"].max()
+        growth=(grew[grew["Growth"]==mx]["Scholar"].tolist(),mx)
+    return high,low,growth
+
+def render_assessment_insights(df, subject, label):
+    st.markdown("### Insights")
+    hi,lo,growth=assessment_high_low_growth(df)
+    a,b,c=st.columns(3)
+    with a:
+        st.markdown("**⭐ Highest Score**")
+        if hi:
+            st.success(f"{', '.join(hi[0])} — {hi[1]:g}")
+        else:
+            st.caption("Will populate after scores are entered.")
+    with b:
+        st.markdown("**↘ Lowest Score**")
+        if lo:
+            st.warning(f"{', '.join(lo[0])} — {lo[1]:g}")
+        else:
+            st.caption("Will populate after scores are entered.")
+    with c:
+        st.markdown("**📈 Highest Growth (Fall → Spring)**")
+        if growth:
+            st.success(f"{', '.join(growth[0])} — +{growth[1]:g}")
+        else:
+            st.caption("Will populate after Fall and Spring scores are entered.")
+
+    st.caption(f"{label} insights shown for {subject}. Highest/lowest use the latest available score (Spring, then Winter, then Fall).")
+    show=df[["Scholar","Fall","Winter","Spring","Goal","Growth"]].copy() if not df.empty else pd.DataFrame(columns=["Scholar","Fall","Winter","Spring","Goal","Growth"])
+    st.dataframe(show,hide_index=True,use_container_width=True)
+
+def render_nwea_center(class_id=None):
+    st.markdown("## 📊 NWEA MAP Growth")
+    st.caption(f"Scope: **{assessment_scope_label(class_id)}** · Track Reading and Math RIT scores, goals, rankings, and Fall-to-Spring growth.")
+
+    roster=assessment_roster(class_id)
+    subject=st.radio("Subject",["Reading","Math"],horizontal=True,key="nwea_subject_separate")
+    side="reading" if subject=="Reading" else "math"
+
+    if roster.empty:
+        st.selectbox("Scholar",["No scholars yet"],disabled=True,key="nwea_empty_scholar")
+        g1,g2,g3,g4=st.columns(4)
+        g1.text_input("Goal (End-of-Year RIT)",disabled=True,key="nwea_empty_goal")
+        g2.text_input("Fall RIT",disabled=True,key="nwea_empty_fall")
+        g3.text_input("Winter RIT",disabled=True,key="nwea_empty_winter")
+        g4.text_input("Spring RIT",disabled=True,key="nwea_empty_spring")
+        st.button("Save NWEA Scores",disabled=True,key="nwea_empty_save")
+        render_assessment_insights(pd.DataFrame(columns=["Scholar","Fall","Winter","Spring","Goal","Latest","Growth"]),subject,"NWEA")
+        st.info("Add scholars in the Scholars section. Their names will automatically appear in the Scholar dropdown.")
+        return
+
+    sid=st.selectbox("Scholar",list(roster.id.astype(int)),format_func=lambda x:nm(roster[roster.id==x].iloc[0]),key="nwea_scholar_separate")
+    br=benchmark_for_scholar(sid)
+    def bv(k):
+        return str(br[k] or "") if br and k in br.keys() else ""
+
+    with st.form("nwea_separate_form"):
+        goal=st.text_input("Goal (End-of-Year RIT)",value=bv(f"nwea_{side}_goal"),placeholder="Example: 195")
+        a,b,c=st.columns(3)
+        fall=a.text_input("Fall RIT",value=bv(f"nwea_fall_{side}"),placeholder="RIT score")
+        winter=b.text_input("Winter RIT",value=bv(f"nwea_winter_{side}"),placeholder="RIT score")
+        spring=c.text_input("Spring RIT",value=bv(f"nwea_spring_{side}"),placeholder="RIT score")
+        if st.form_submit_button("Save NWEA Scores"):
+            other="math" if side=="reading" else "reading"
+            existing=benchmark_for_scholar(sid)
+            def ev(k):
+                return str(existing[k] or "") if existing and k in existing.keys() else ""
+            vals={
+                "nwea_fall_reading":fall if side=="reading" else ev("nwea_fall_reading"),
+                "nwea_winter_reading":winter if side=="reading" else ev("nwea_winter_reading"),
+                "nwea_spring_reading":spring if side=="reading" else ev("nwea_spring_reading"),
+                "nwea_reading_goal":goal if side=="reading" else ev("nwea_reading_goal"),
+                "nwea_fall_math":fall if side=="math" else ev("nwea_fall_math"),
+                "nwea_winter_math":winter if side=="math" else ev("nwea_winter_math"),
+                "nwea_spring_math":spring if side=="math" else ev("nwea_spring_math"),
+                "nwea_math_goal":goal if side=="math" else ev("nwea_math_goal"),
+                "fp_fall_level":ev("fp_fall_level"),
+                "fp_winter_level":ev("fp_winter_level"),
+                "fp_spring_level":ev("fp_spring_level"),
+                "fp_fall_word_list":ev("fp_fall_word_list"),
+                "fp_winter_word_list":ev("fp_winter_word_list"),
+                "fp_spring_word_list":ev("fp_spring_word_list"),
+                "notes":ev("notes"),
+            }
+            cdb=conn()
+            cdb.execute("""INSERT INTO benchmark_scores(
+                scholar_id,nwea_fall_reading,nwea_winter_reading,nwea_spring_reading,
+                nwea_fall_math,nwea_winter_math,nwea_spring_math,nwea_reading_goal,nwea_math_goal,
+                fp_fall_level,fp_winter_level,fp_spring_level,fp_fall_word_list,fp_winter_word_list,fp_spring_word_list,notes)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(scholar_id) DO UPDATE SET
+                nwea_fall_reading=excluded.nwea_fall_reading,
+                nwea_winter_reading=excluded.nwea_winter_reading,
+                nwea_spring_reading=excluded.nwea_spring_reading,
+                nwea_fall_math=excluded.nwea_fall_math,
+                nwea_winter_math=excluded.nwea_winter_math,
+                nwea_spring_math=excluded.nwea_spring_math,
+                nwea_reading_goal=excluded.nwea_reading_goal,
+                nwea_math_goal=excluded.nwea_math_goal,
+                fp_fall_level=excluded.fp_fall_level,
+                fp_winter_level=excluded.fp_winter_level,
+                fp_spring_level=excluded.fp_spring_level,
+                fp_fall_word_list=excluded.fp_fall_word_list,
+                fp_winter_word_list=excluded.fp_winter_word_list,
+                fp_spring_word_list=excluded.fp_spring_word_list,
+                notes=excluded.notes""",
+                (sid,vals["nwea_fall_reading"],vals["nwea_winter_reading"],vals["nwea_spring_reading"],
+                 vals["nwea_fall_math"],vals["nwea_winter_math"],vals["nwea_spring_math"],vals["nwea_reading_goal"],vals["nwea_math_goal"],
+                 vals["fp_fall_level"],vals["fp_winter_level"],vals["fp_spring_level"],vals["fp_fall_word_list"],vals["fp_winter_word_list"],vals["fp_spring_word_list"],vals["notes"]))
+            cdb.commit(); cdb.close()
+            st.success("NWEA scores saved.")
+            st.rerun()
+
+    render_assessment_insights(nwea_scope_dataframe(class_id,subject),subject,"NWEA")
+
+def render_fp_center(class_id=None):
+    st.markdown("## 📚 F&P Reading Levels")
+    st.caption(f"Scope: **{assessment_scope_label(class_id)}** · F&P is separate from NWEA and can be entered at any time.")
+
+    roster=assessment_roster(class_id)
+    if roster.empty:
+        st.selectbox("Scholar",["No scholars yet"],disabled=True,key="fp_empty_scholar")
+        a,b,c=st.columns(3)
+        a.text_input("Fall F&P Level",disabled=True,key="fp_empty_fall")
+        b.text_input("Winter / Midyear F&P Level",disabled=True,key="fp_empty_winter")
+        c.text_input("Spring F&P Level",disabled=True,key="fp_empty_spring")
+        w1,w2,w3=st.columns(3)
+        w1.text_input("Fall Word List Level / Score",disabled=True,key="fp_empty_word1")
+        w2.text_input("Winter Word List Level / Score",disabled=True,key="fp_empty_word2")
+        w3.text_input("Spring Word List Level / Score",disabled=True,key="fp_empty_word3")
+        st.button("Save F&P Data",disabled=True,key="fp_empty_save")
+        st.info("Add scholars in the Scholars section. Their names will automatically populate here.")
+        return
+
+    sid=st.selectbox("Scholar",list(roster.id.astype(int)),format_func=lambda x:nm(roster[roster.id==x].iloc[0]),key="fp_scholar_separate")
+    br=benchmark_for_scholar(sid)
+    def bv(k):
+        return str(br[k] or "") if br and k in br.keys() else ""
+
+    with st.form("fp_separate_form"):
+        a,b,c=st.columns(3)
+        fall=a.text_input("Fall F&P Level",value=bv("fp_fall_level"),placeholder="Example: L")
+        winter=b.text_input("Winter / Midyear F&P Level",value=bv("fp_winter_level"),placeholder="Example: M")
+        spring=c.text_input("Spring F&P Level",value=bv("fp_spring_level"),placeholder="Example: N")
+        w1,w2,w3=st.columns(3)
+        wf=w1.text_input("Fall Word List Level / Score",value=bv("fp_fall_word_list"))
+        ww=w2.text_input("Winter Word List Level / Score",value=bv("fp_winter_word_list"))
+        ws=w3.text_input("Spring Word List Level / Score",value=bv("fp_spring_word_list"))
+        notes=st.text_area("F&P Notes",value=bv("notes"))
+        if st.form_submit_button("Save F&P Data"):
+            cdb=conn()
+            existing=benchmark_for_scholar(sid)
+            def ev(k):
+                return str(existing[k] or "") if existing and k in existing.keys() else ""
+            cdb.execute("""INSERT INTO benchmark_scores(
+                scholar_id,nwea_fall_reading,nwea_winter_reading,nwea_spring_reading,
+                nwea_fall_math,nwea_winter_math,nwea_spring_math,nwea_reading_goal,nwea_math_goal,
+                fp_fall_level,fp_winter_level,fp_spring_level,fp_fall_word_list,fp_winter_word_list,fp_spring_word_list,notes)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(scholar_id) DO UPDATE SET
+                fp_fall_level=excluded.fp_fall_level,
+                fp_winter_level=excluded.fp_winter_level,
+                fp_spring_level=excluded.fp_spring_level,
+                fp_fall_word_list=excluded.fp_fall_word_list,
+                fp_winter_word_list=excluded.fp_winter_word_list,
+                fp_spring_word_list=excluded.fp_spring_word_list,
+                notes=excluded.notes""",
+                (sid,ev("nwea_fall_reading"),ev("nwea_winter_reading"),ev("nwea_spring_reading"),
+                 ev("nwea_fall_math"),ev("nwea_winter_math"),ev("nwea_spring_math"),ev("nwea_reading_goal"),ev("nwea_math_goal"),
+                 fall,winter,spring,wf,ww,ws,notes))
+            cdb.commit(); cdb.close()
+            st.success("F&P data saved.")
+            st.rerun()
+
+    # F&P class/all-scholar snapshot.
+    rows=[]
+    for _,sr in roster.iterrows():
+        r=benchmark_for_scholar(int(sr.id))
+        rows.append({
+            "Scholar":nm(sr),
+            "Fall":str(r["fp_fall_level"] or "") if r else "",
+            "Winter / Midyear":str(r["fp_winter_level"] or "") if r and "fp_winter_level" in r.keys() else "",
+            "Spring":str(r["fp_spring_level"] or "") if r else "",
+        })
+    st.markdown("### F&P Snapshot")
+    st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
+
+def render_iready_center(class_id=None):
+    st.markdown("## 🟣 I‑Ready Diagnostics")
+    st.caption(f"Scope: **{assessment_scope_label(class_id)}** · Track Reading and Math diagnostic scale scores, goals, rankings, and growth.")
+
+    roster=assessment_roster(class_id)
+    subject=st.radio("Subject",["Reading","Math"],horizontal=True,key="iready_subject_separate")
+    side="reading" if subject=="Reading" else "math"
+
+    if roster.empty:
+        st.selectbox("Scholar",["No scholars yet"],disabled=True,key="iready_empty_scholar")
+        g1,g2,g3,g4=st.columns(4)
+        g1.text_input("Goal (End-of-Year Scale Score)",disabled=True,key="iready_empty_goal")
+        g2.text_input("Fall Diagnostic",disabled=True,key="iready_empty_fall")
+        g3.text_input("Winter / Midyear Diagnostic",disabled=True,key="iready_empty_winter")
+        g4.text_input("Spring Diagnostic",disabled=True,key="iready_empty_spring")
+        st.button("Save I‑Ready Scores",disabled=True,key="iready_empty_save")
+        render_assessment_insights(pd.DataFrame(columns=["Scholar","Fall","Winter","Spring","Goal","Latest","Growth"]),subject,"I‑Ready")
+        st.info("Add scholars in the Scholars section. Their names will automatically populate here.")
+        return
+
+    sid=st.selectbox("Scholar",list(roster.id.astype(int)),format_func=lambda x:nm(roster[roster.id==x].iloc[0]),key="iready_scholar_separate")
+    br=iready_for_scholar(sid)
+    def bv(k):
+        return str(br[k] or "") if br and k in br.keys() else ""
+
+    with st.form("iready_separate_form"):
+        goal=st.text_input("Goal (End-of-Year Scale Score)",value=bv(f"{side}_goal"),placeholder="Target scale score")
+        a,b,c=st.columns(3)
+        fall=a.text_input("Fall Diagnostic",value=bv(f"fall_{side}"),placeholder="Scale score")
+        winter=b.text_input("Winter / Midyear Diagnostic",value=bv(f"winter_{side}"),placeholder="Scale score")
+        spring=c.text_input("Spring Diagnostic",value=bv(f"spring_{side}"),placeholder="Scale score")
+        notes=st.text_area("I‑Ready Notes",value=bv("notes"))
+        if st.form_submit_button("Save I‑Ready Scores"):
+            existing=iready_for_scholar(sid)
+            def ev(k):
+                return str(existing[k] or "") if existing and k in existing.keys() else ""
+            vals={
+                "fall_reading":fall if side=="reading" else ev("fall_reading"),
+                "winter_reading":winter if side=="reading" else ev("winter_reading"),
+                "spring_reading":spring if side=="reading" else ev("spring_reading"),
+                "reading_goal":goal if side=="reading" else ev("reading_goal"),
+                "fall_math":fall if side=="math" else ev("fall_math"),
+                "winter_math":winter if side=="math" else ev("winter_math"),
+                "spring_math":spring if side=="math" else ev("spring_math"),
+                "math_goal":goal if side=="math" else ev("math_goal"),
+            }
+            cdb=conn()
+            cdb.execute("""INSERT INTO iready_scores(
+                scholar_id,fall_reading,winter_reading,spring_reading,reading_goal,
+                fall_math,winter_math,spring_math,math_goal,notes)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(scholar_id) DO UPDATE SET
+                fall_reading=excluded.fall_reading,
+                winter_reading=excluded.winter_reading,
+                spring_reading=excluded.spring_reading,
+                reading_goal=excluded.reading_goal,
+                fall_math=excluded.fall_math,
+                winter_math=excluded.winter_math,
+                spring_math=excluded.spring_math,
+                math_goal=excluded.math_goal,
+                notes=excluded.notes""",
+                (sid,vals["fall_reading"],vals["winter_reading"],vals["spring_reading"],vals["reading_goal"],
+                 vals["fall_math"],vals["winter_math"],vals["spring_math"],vals["math_goal"],notes))
+            cdb.commit(); cdb.close()
+            st.success("I‑Ready diagnostic data saved.")
+            st.rerun()
+
+    render_assessment_insights(iready_scope_dataframe(class_id,subject),subject,"I‑Ready")
+
 # ---------- App Shell ----------
 cdf=classes_df()
 folder={0:"All Classes", **{int(r.id):r.class_name for _,r in cdf.iterrows()}}
@@ -2903,12 +3665,12 @@ elif page=="Scholar Profile":
             else: st.dataframe(rem[["due_date","guardian","reason","notes","completed"]],hide_index=True,use_container_width=True)
 
 elif page=="Scholar Binder":
-    st.markdown('<div class="page-title">Grades</div><div class="page-subtitle">Assignments, gradebook, standards, NWEA/F&P, and grade settings.</div>',unsafe_allow_html=True)
+    st.markdown('<div class="page-title">Grades</div><div class="page-subtitle">Assignments, gradebook, standards, NWEA, F&P, I-Ready, Interims, and grade settings.</div>',unsafe_allow_html=True)
 
     # Grades is always visible, even before a class or scholar has been added.
     binder_tool=st.radio(
         "Gradebook Section",
-        ["Overview","Add Assignment","Skills & Standards","Work Samples","NWEA & F&P","Grade Settings"],
+        ["Overview","Add Assignment","Skills & Standards","Work Samples","NWEA","F&P","I-Ready","Interims","Grade Settings"],
         horizontal=True,
         key="class_binder_tool"
     )
@@ -2971,17 +3733,17 @@ elif page=="Scholar Binder":
             st.file_uploader("Upload Scholar Work",disabled=True,key="preview_work_sample")
             st.info("The scholar selector and saved work samples will appear here after a roster is added.")
 
-        elif binder_tool=="NWEA & F&P":
-            st.markdown("## NWEA & F&P")
-            n1,n2=st.columns(2)
-            with n1:
-                st.markdown("### NWEA")
-                st.caption("NWEA fields and scholar rows will populate after scholars are added.")
-                st.dataframe(pd.DataFrame(columns=["Scholar","Reading","Math"]),hide_index=True,use_container_width=True)
-            with n2:
-                st.markdown("### F&P")
-                st.caption("F&P reading levels will populate after scholars are added.")
-                st.dataframe(pd.DataFrame(columns=["Scholar","F&P Level"]),hide_index=True,use_container_width=True)
+        elif binder_tool=="NWEA":
+            render_nwea_center(None)
+
+        elif binder_tool=="F&P":
+            render_fp_center(None)
+
+        elif binder_tool=="I-Ready":
+            render_iready_center(None)
+
+        elif binder_tool=="Interims":
+            render_interim_center(None)
 
         elif binder_tool=="Grade Settings":
             st.markdown("## Grade Settings")
@@ -3256,143 +4018,17 @@ elif page=="Scholar Binder":
                     c=conn(); c.execute("""INSERT INTO work_samples(scholar_id,uploaded_at,subject,title,file_name,file_path,teacher_observation,strengths,needs,next_steps)
                                          VALUES (?,?,?,?,?,?,?,?,?,?)""",(sid,datetime.now().isoformat(timespec="minutes"),subj,title,fn,fp,obs,strengths,needs,nxt)); c.commit(); c.close(); st.success("Saved."); st.rerun()
 
-        elif binder_tool=="NWEA & F&P":
-            st.markdown("## 📊 NWEA & F&P Assessment Data")
-            st.caption("Enter each scholar's benchmark scores here. These scores feed the scholar profile, growth summaries, parent updates, and support/IEP helper.")
+        elif binder_tool=="NWEA":
+            render_nwea_center(selected_class)
 
-            roster=scholars_df(selected_class if selected_class else None)
-            if roster.empty:
-                st.info("There are no scholars available. Select a class on Home Page or add scholars first.")
-            else:
-                sid=st.selectbox(
-                    "Scholar",
-                    list(roster.id.astype(int)),
-                    format_func=lambda x:nm(roster[roster.id==x].iloc[0]),
-                    key="assessment_student_v134"
-                )
-                scholar_name=nm(roster[roster.id==sid].iloc[0])
-                br=benchmark_for_scholar(sid)
-                def bv(k):
-                    if not br or k not in br.keys():
-                        return ""
-                    return str(br[k] or "")
+        elif binder_tool=="F&P":
+            render_fp_center(selected_class)
 
-                st.markdown(f"### {scholar_name}")
-                with st.form("assessment_entry_v134"):
-                    st.markdown("### NWEA MAP Growth — RIT Scores")
-                    r1,r2,r3=st.columns(3)
-                    fall_read=r1.text_input("ELA / Reading — Fall",value=bv("nwea_fall_reading"),placeholder="RIT score")
-                    winter_read=r2.text_input("ELA / Reading — Winter",value=bv("nwea_winter_reading"),placeholder="RIT score")
-                    spring_read=r3.text_input("ELA / Reading — Spring",value=bv("nwea_spring_reading"),placeholder="RIT score")
+        elif binder_tool=="I-Ready":
+            render_iready_center(selected_class)
 
-                    m1,m2,m3=st.columns(3)
-                    fall_math=m1.text_input("Math — Fall",value=bv("nwea_fall_math"),placeholder="RIT score")
-                    winter_math=m2.text_input("Math — Winter",value=bv("nwea_winter_math"),placeholder="RIT score")
-                    spring_math=m3.text_input("Math — Spring",value=bv("nwea_spring_math"),placeholder="RIT score")
-
-                    st.markdown("### Individual NWEA Goal")
-                    g1,g2=st.columns(2)
-                    reading_goal=g1.text_input("ELA / Reading Goal",value=bv("nwea_reading_goal"),placeholder="Target RIT")
-                    math_goal=g2.text_input("Math Goal",value=bv("nwea_math_goal"),placeholder="Target RIT")
-
-                    st.markdown("### F&P")
-                    f1,f2=st.columns(2)
-                    fp_fall=f1.text_input("Fall F&P Reading Level",value=bv("fp_fall_level"),placeholder="Example: L")
-                    fp_spring=f2.text_input("Spring F&P Reading Level",value=bv("fp_spring_level"),placeholder="Example: N")
-                    w1,w2=st.columns(2)
-                    word_fall=w1.text_input("Fall F&P Word List Level / Score",value=bv("fp_fall_word_list"))
-                    word_spring=w2.text_input("Spring F&P Word List Level / Score",value=bv("fp_spring_word_list"))
-                    notes=st.text_area("Assessment Notes",value=bv("notes"))
-
-                    if st.form_submit_button("Save NWEA & F&P Data"):
-                        c=conn()
-                        c.execute("""INSERT INTO benchmark_scores(
-                            scholar_id,nwea_fall_reading,nwea_winter_reading,nwea_spring_reading,
-                            nwea_fall_math,nwea_winter_math,nwea_spring_math,nwea_reading_goal,nwea_math_goal,
-                            fp_fall_level,fp_spring_level,fp_fall_word_list,fp_spring_word_list,notes)
-                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                            ON CONFLICT(scholar_id) DO UPDATE SET
-                            nwea_fall_reading=excluded.nwea_fall_reading,
-                            nwea_winter_reading=excluded.nwea_winter_reading,
-                            nwea_spring_reading=excluded.nwea_spring_reading,
-                            nwea_fall_math=excluded.nwea_fall_math,
-                            nwea_winter_math=excluded.nwea_winter_math,
-                            nwea_spring_math=excluded.nwea_spring_math,
-                            nwea_reading_goal=excluded.nwea_reading_goal,
-                            nwea_math_goal=excluded.nwea_math_goal,
-                            fp_fall_level=excluded.fp_fall_level,
-                            fp_spring_level=excluded.fp_spring_level,
-                            fp_fall_word_list=excluded.fp_fall_word_list,
-                            fp_spring_word_list=excluded.fp_spring_word_list,
-                            notes=excluded.notes""",
-                            (sid,fall_read,winter_read,spring_read,fall_math,winter_math,spring_math,
-                             reading_goal,math_goal,fp_fall,fp_spring,word_fall,word_spring,notes))
-                        c.commit(); c.close()
-                        st.success("Assessment data saved.")
-                        st.rerun()
-
-                br=benchmark_for_scholar(sid)
-                if br:
-                    st.markdown("### Progress Snapshot")
-                    def n(v):
-                        try: return float(v)
-                        except: return None
-                    rg=n(br["nwea_reading_goal"]) if "nwea_reading_goal" in br.keys() else None
-                    mg=n(br["nwea_math_goal"]) if "nwea_math_goal" in br.keys() else None
-                    left,right=st.columns(2)
-                    with left:
-                        st.markdown("**ELA / Reading**")
-                        for season,key in [("Fall","nwea_fall_reading"),("Winter","nwea_winter_reading"),("Spring","nwea_spring_reading")]:
-                            score=n(br[key]) if key in br.keys() else None
-                            if score is not None:
-                                status=""
-                                if rg is not None:
-                                    status=" ✅ Met/Exceeded Goal" if score>=rg else f" — {rg-score:.0f} points from goal"
-                                st.write(f"- {season}: {score:g}{status}")
-                    with right:
-                        st.markdown("**Math**")
-                        for season,key in [("Fall","nwea_fall_math"),("Winter","nwea_winter_math"),("Spring","nwea_spring_math")]:
-                            score=n(br[key]) if key in br.keys() else None
-                            if score is not None:
-                                status=""
-                                if mg is not None:
-                                    status=" ✅ Met/Exceeded Goal" if score>=mg else f" — {mg-score:.0f} points from goal"
-                                st.write(f"- {season}: {score:g}{status}")
-
-            st.markdown("---")
-            st.markdown("## 🎯 Class NWEA Goal Dashboard")
-            if not selected_class:
-                st.info("Select a class on Home Page to use the class goal dashboard.")
-            else:
-                season=st.radio("Testing Season",["Fall","Spring"],horizontal=True,key="class_nwea_season_v134")
-                reading_goal_class=get_nwea_goal(selected_class,season,"Reading")
-                math_goal_class=get_nwea_goal(selected_class,season,"Math")
-                g1,g2=st.columns(2)
-                rgc=g1.number_input("Class Reading / ELA Goal",0.0,400.0,float(reading_goal_class) if reading_goal_class is not None else 190.0,1.0,key="class_rg_v134")
-                mgc=g2.number_input("Class Math Goal",0.0,400.0,float(math_goal_class) if math_goal_class is not None else 190.0,1.0,key="class_mg_v134")
-                if st.button("Save Class NWEA Goals",key="save_class_goals_v134"):
-                    save_nwea_goal(selected_class,season,"Reading",rgc)
-                    save_nwea_goal(selected_class,season,"Math",mgc)
-                    st.success("Class NWEA goals saved.")
-                    st.rerun()
-                class_scores=class_nwea_dataframe(selected_class,season)
-                if not class_scores.empty:
-                    class_scores["Reading Status"]=class_scores["Reading / ELA"].apply(lambda x:"✅ Met / Exceeded" if pd.notna(x) and x>=rgc else ("Below Goal" if pd.notna(x) else "No Score"))
-                    class_scores["Math Status"]=class_scores["Math"].apply(lambda x:"✅ Met / Exceeded" if pd.notna(x) and x>=mgc else ("Below Goal" if pd.notna(x) else "No Score"))
-                    st.dataframe(class_scores,hide_index=True,use_container_width=True)
-                    rh,rl=nwea_rank_summary(class_scores,"Reading / ELA")
-                    mh,ml=nwea_rank_summary(class_scores,"Math")
-                    a,b=st.columns(2)
-                    with a:
-                        st.markdown("**Reading / ELA**")
-                        if rh:
-                            st.success(f"Highest: {', '.join(rh[0])} — {rh[1]:g}")
-                            st.warning(f"Lowest: {', '.join(rl[0])} — {rl[1]:g}")
-                    with b:
-                        st.markdown("**Math**")
-                        if mh:
-                            st.success(f"Highest: {', '.join(mh[0])} — {mh[1]:g}")
-                            st.warning(f"Lowest: {', '.join(ml[0])} — {ml[1]:g}")
+        elif binder_tool=="Interims":
+            render_interim_center(selected_class)
 
         elif binder_tool=="Grade Settings":
             w=pd.DataFrame([{"Category":k,"Weight %":v} for k,v in get_setting("weights").items()])
