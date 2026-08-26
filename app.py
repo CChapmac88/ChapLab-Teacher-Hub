@@ -6540,6 +6540,150 @@ elif page=="Communication Log":
                 st.rerun()
 
 
+elif page=="Web & Backup":
+    st.markdown(
+        '<div class="page-title">Web & Backup</div>'
+        '<div class="page-subtitle">Cloud connection, database backups, restore/migration, and session controls.</div>',
+        unsafe_allow_html=True
+    )
+
+    # ---------------- Cloud Status ----------------
+    st.markdown("### ☁️ Cloud Storage")
+    if cloud_configured():
+        st.success("Cloud storage is connected.")
+        cfg=cloud_config()
+        st.caption(
+            f"Bucket: {cfg['bucket']} • Database object: {cfg['db_object']}"
+        )
+        if st.session_state.get("_cloud_sync_error"):
+            st.warning("Last sync message: "+str(st.session_state["_cloud_sync_error"]))
+    else:
+        st.info(
+            "ChapLab is currently running without a configured cloud-storage connection. "
+            "Local database tools below are still available."
+        )
+
+    # ---------------- Database Backup ----------------
+    st.markdown("---")
+    st.markdown("### 💾 Database Backup")
+    st.caption(
+        "Download a complete copy of the current ChapLab database. "
+        "This includes classes, scholars, grades, assessments, communications, newsletter records, "
+        "Bulletin Board entries, settings, and other saved app data."
+    )
+
+    db_path=Path(DB)
+    if db_path.exists():
+        st.download_button(
+            "⬇️ Download Current ChapLab Database",
+            data=db_path.read_bytes(),
+            file_name=f"teacher_tracker_backup_{date.today().isoformat()}.db",
+            mime="application/x-sqlite3",
+            use_container_width=True,
+            key="download_db_backup_v4017"
+        )
+    else:
+        st.warning("The ChapLab database file is not currently available for download.")
+
+    if cloud_configured():
+        st.markdown("### Manual Cloud Sync")
+        st.caption(
+            "ChapLab does not automatically block startup waiting for the cloud. "
+            "Use this button when you intentionally want to push the current database to cloud storage."
+        )
+        if st.button("☁️ Sync Database Now",use_container_width=True,key="sync_db_now_v4017"):
+            if cloud_upload_file(DB):
+                st.session_state.pop("_cloud_sync_error",None)
+                st.success("Database synced to private cloud storage.")
+            else:
+                st.error("Cloud sync did not complete. Check the Supabase settings and bucket.")
+
+    # ---------------- Restore / Migrate ----------------
+    st.markdown("---")
+    st.markdown("### ♻️ Restore / Migrate Existing ChapLab Data")
+    st.caption(
+        "Upload a previous ChapLab SQLite database if you need to restore a backup or move existing "
+        "ChapLab data into this web version."
+    )
+
+    restore=st.file_uploader(
+        "Upload an existing teacher_tracker.db or backup .db file",
+        type=["db","sqlite","sqlite3"],
+        key="restore_chaplab_db_v4017"
+    )
+    confirm_restore=st.checkbox(
+        "I understand this will replace the database currently being used by this ChapLab installation.",
+        key="confirm_restore_db_v4017"
+    )
+
+    if st.button(
+        "Restore Uploaded Database",
+        disabled=(restore is None or not confirm_restore),
+        use_container_width=True,
+        key="restore_db_button_v4017"
+    ):
+        raw=bytes(restore.getbuffer())
+        tmp_path=Path(tempfile.gettempdir())/"chaplab_restore_check.db"
+        tmp_path.write_bytes(raw)
+        try:
+            check=sqlite3.connect(str(tmp_path))
+            integrity=check.execute("PRAGMA integrity_check").fetchone()[0]
+            tables={r[0] for r in check.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            check.close()
+
+            if str(integrity).lower()!="ok":
+                raise ValueError("SQLite integrity check did not pass.")
+            if "scholars" not in tables or "settings" not in tables:
+                raise ValueError("This does not appear to be a ChapLab database.")
+
+            # Create an automatic safety copy before replacing the active DB.
+            if Path(DB).exists():
+                safety=Path(tempfile.gettempdir())/f"chaplab_before_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+                safety.write_bytes(Path(DB).read_bytes())
+
+            Path(DB).write_bytes(raw)
+
+            # Run normal migrations so older ChapLab databases gain newer tables/columns.
+            st.cache_resource.clear()
+            st.success("Database restored. ChapLab will reload and apply any required database updates.")
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"Could not restore this database: {e}")
+
+    # ---------------- Creator / Demo Safety ----------------
+    if is_creator_account():
+        st.markdown("---")
+        st.markdown("### 🧪 Creator / Demo Data")
+        demo=demo_setting()
+        st.write(f"Demo Class: **{'ON' if demo['enabled'] else 'OFF'}**")
+        st.caption(
+            "Use Profile Settings → Creator Rollout Controls to change Demo Mode or rollout settings. "
+            "Turning Demo Mode off hides demo records and does not delete real teacher data."
+        )
+
+    # ---------------- Session ----------------
+    if auth_config():
+        st.markdown("---")
+        st.markdown("### 🔐 Session")
+        st.caption(f"Signed in as: {current_author_name()}")
+        if st.button("Sign Out",key="chaplab_signout_v4017"):
+            st.session_state["chaplab_authenticated"]=False
+            st.session_state.pop("chaplab_username",None)
+            st.rerun()
+
+    # ---------------- Safety Note ----------------
+    st.markdown("---")
+    st.markdown("### Important")
+    st.warning(
+        "Keep downloaded database backups in a secure location. ChapLab may contain student information. "
+        "Use only storage and sharing services approved by your school or organization. "
+        "Avoid editing the same database from multiple devices at exactly the same time."
+    )
+
+
 st.markdown("""
 <style>
 /* ==========================================================
