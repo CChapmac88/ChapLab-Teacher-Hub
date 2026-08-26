@@ -37,7 +37,9 @@ def cloud_config():
     if not cfg:
         return None
     try:
-        url=str(cfg.get("url","")).strip()
+        url=str(cfg.get("url","")).strip().rstrip("/")
+        # Accept either the project URL or an accidentally pasted REST endpoint.
+        url=re.sub(r"/rest/v1/?$","",url,flags=re.I)
         key=str(cfg.get("service_role_key","")).strip()
         bucket=str(cfg.get("bucket","chaplab-private")).strip() or "chaplab-private"
         db_object=str(cfg.get("database_object","teacher_tracker.db")).strip() or "teacher_tracker.db"
@@ -90,61 +92,111 @@ def require_login():
 
 require_login()
 
-@st.cache_resource
-def supabase_client():
+def _cloud_headers(content_type=None):
     cfg=cloud_config()
     if not cfg:
-        return None
-    if create_client is None:
-        raise RuntimeError("The Supabase package is not installed. Install requirements.txt and restart ChapLab.")
-    return create_client(cfg["url"],cfg["key"])
+        return {}
+    headers={
+        "Authorization":f"Bearer {cfg['key']}",
+        "apikey":cfg["key"],
+    }
+    if content_type:
+        headers["Content-Type"]=content_type
+    return headers
+
+def _storage_url(path=""):
+    cfg=cloud_config()
+    if not cfg:
+        return ""
+    return f"{cfg['url']}/storage/v1/{path.lstrip('/')}"
 
 @st.cache_resource
 def ensure_cloud_bucket():
+    """Ensure the private bucket exists, but never block app startup for long."""
     if not cloud_configured():
         return False
-    client=supabase_client()
     cfg=cloud_config()
     try:
-        client.storage.create_bucket(
-            cfg["bucket"],
-            options={"public":False,"file_size_limit":52428800}
+        # First check the bucket. A 200 means it already exists.
+        check=requests.get(
+            _storage_url(f"bucket/{cfg['bucket']}"),
+            headers=_cloud_headers(),
+            timeout=(3,5)
         )
-    except Exception:
-        # The normal case after first setup is that the private bucket already exists.
-        pass
-    return True
+        if check.status_code==200:
+            return True
+
+        # Otherwise try to create it. 400/409 may simply mean it exists.
+        create=requests.post(
+            _storage_url("bucket"),
+            headers=_cloud_headers("application/json"),
+            json={
+                "id":cfg["bucket"],
+                "name":cfg["bucket"],
+                "public":False,
+                "file_size_limit":52428800
+            },
+            timeout=(3,5)
+        )
+        if create.status_code in (200,201,400,409):
+            return True
+        st.session_state["_cloud_sync_error"]=f"Bucket check returned HTTP {create.status_code}."
+        return False
+    except Exception as e:
+        st.session_state["_cloud_sync_error"]=f"Cloud bucket check timed out or failed: {e}"
+        return False
 
 def cloud_download_bytes(remote_path):
+    """Download with a short timeout; failure falls back to the local DB."""
     if not cloud_configured():
         return None
-    ensure_cloud_bucket()
     cfg=cloud_config()
     try:
-        return supabase_client().storage.from_(cfg["bucket"]).download(remote_path)
-    except Exception:
+        if not ensure_cloud_bucket():
+            return None
+        r=requests.get(
+            _storage_url(f"object/{cfg['bucket']}/{remote_path.lstrip('/')}"),
+            headers=_cloud_headers(),
+            timeout=(3,8)
+        )
+        if r.status_code==200:
+            st.session_state.pop("_cloud_sync_error",None)
+            return r.content
+        if r.status_code not in (400,404):
+            st.session_state["_cloud_sync_error"]=f"Database download returned HTTP {r.status_code}."
+        return None
+    except Exception as e:
+        st.session_state["_cloud_sync_error"]=f"Database download timed out or failed: {e}"
         return None
 
 def cloud_upload_bytes(data, remote_path, content_type="application/octet-stream"):
+    """Upload with a bounded timeout. It is safe for background use."""
     if not cloud_configured():
         return False
-    ensure_cloud_bucket()
     cfg=cloud_config()
-    with _CLOUD_LOCK:
-        try:
-            supabase_client().storage.from_(cfg["bucket"]).upload(
-                path=remote_path,
-                file=data,
-                file_options={
-                    "cache-control":"0",
-                    "upsert":"true",
-                    "content-type":content_type
-                }
-            )
-            return True
-        except Exception as e:
-            st.session_state["_cloud_sync_error"]=str(e)
+    try:
+        if not ensure_cloud_bucket():
             return False
+        headers=_cloud_headers(content_type)
+        headers["x-upsert"]="true"
+        r=requests.post(
+            _storage_url(f"object/{cfg['bucket']}/{remote_path.lstrip('/')}"),
+            headers=headers,
+            data=data,
+            timeout=(3,10)
+        )
+        if r.status_code in (200,201):
+            return True
+        # Some Storage versions prefer PUT for an upsert.
+        r=requests.put(
+            _storage_url(f"object/{cfg['bucket']}/{remote_path.lstrip('/')}"),
+            headers=headers,
+            data=data,
+            timeout=(3,10)
+        )
+        return r.status_code in (200,201)
+    except Exception:
+        return False
 
 def cloud_upload_file(local_path, remote_path=None):
     local_path=Path(local_path)
@@ -153,6 +205,22 @@ def cloud_upload_file(local_path, remote_path=None):
     cfg=cloud_config()
     remote_path=remote_path or cfg["db_object"]
     return cloud_upload_bytes(local_path.read_bytes(),remote_path,"application/x-sqlite3")
+
+def _background_cloud_upload(local_path):
+    """Snapshot the DB now, then sync without blocking a button click/rerun."""
+    if not cloud_configured():
+        return
+    try:
+        payload=Path(local_path).read_bytes()
+        cfg=cloud_config()
+        remote=cfg["db_object"]
+    except Exception:
+        return
+
+    def worker():
+        with _CLOUD_LOCK:
+            cloud_upload_bytes(payload,remote,"application/x-sqlite3")
+    threading.Thread(target=worker,daemon=True).start()
 
 def cloud_download_database(target):
     if not cloud_configured():
@@ -168,22 +236,28 @@ def cloud_download_database(target):
 
 @st.cache_resource
 def prepare_database():
+    """
+    Startup rule:
+    - Try cloud briefly.
+    - Never let cloud hold the app on a loading spinner.
+    - If there is no cloud DB yet, open a fresh local web DB immediately.
+    """
     if not cloud_configured():
         return str(LEGACY_DB)
 
-    ensure_cloud_bucket()
-
-    # Preferred: the persistent cloud copy.
+    # One bounded download attempt. All network calls above have hard timeouts.
     if cloud_download_database(WEB_DB):
         return str(WEB_DB)
 
-    # First migration from the user's existing local ChapLab database.
+    # If an old bundled DB exists, use a copy of it. Do NOT wait for upload here.
     if LEGACY_DB.exists():
-        shutil.copy2(LEGACY_DB,WEB_DB)
-        cloud_upload_file(WEB_DB)
-        return str(WEB_DB)
+        try:
+            shutil.copy2(LEGACY_DB,WEB_DB)
+        except Exception:
+            pass
+        return str(WEB_DB if WEB_DB.exists() else LEGACY_DB)
 
-    # Brand-new web installation. init_db() will create it, then commit syncs it.
+    # Fresh web install: SQLite will create this immediately in init_db().
     return str(WEB_DB)
 
 DB = prepare_database()
@@ -192,8 +266,8 @@ def cloud_status_text():
     if not cloud_configured():
         return "Local mode"
     if st.session_state.get("_cloud_sync_error"):
-        return "Cloud configured — last sync needs attention"
-    return "Cloud connected"
+        return "Cloud configured — app running locally; sync needs attention"
+    return "Cloud configured"
 
 # ---------- Composition notebook style ----------
 st.markdown("""
@@ -325,11 +399,7 @@ class ChapLabConnection(sqlite3.Connection):
     def commit(self):
         result=super().commit()
         if cloud_configured():
-            try:
-                cloud_upload_file(DB)
-                st.session_state.pop("_cloud_sync_error",None)
-            except Exception as e:
-                st.session_state["_cloud_sync_error"]=str(e)
+            _background_cloud_upload(DB)
         return result
 
 def conn():
@@ -4495,4 +4565,99 @@ elif page=="Communication Log":
                 delete_record("communications",edit_id)
                 st.success("Communication record deleted.")
                 st.rerun()
+
+
+st.markdown("""
+<style>
+/* ==========================================================
+   ChapLab v4.0.5 — Sidebar Visibility Fix ONLY
+   ========================================================== */
+
+/* Re-enable the native Streamlit sidebar that v4.0 CSS was hiding */
+section[data-testid="stSidebar"]{
+    display:block !important;
+    visibility:visible !important;
+    width:270px !important;
+    min-width:270px !important;
+    max-width:270px !important;
+    background:linear-gradient(180deg,#123f8c,#0d2f6a) !important;
+    color:white !important;
+    border-right:none !important;
+    box-shadow:5px 0 18px rgba(0,0,0,.12) !important;
+    z-index:10000 !important;
+}
+section[data-testid="stSidebar"] > div{
+    display:block !important;
+    visibility:visible !important;
+}
+[data-testid="collapsedControl"]{
+    display:none !important;
+}
+
+/* Sidebar text */
+section[data-testid="stSidebar"] h1,
+section[data-testid="stSidebar"] h2,
+section[data-testid="stSidebar"] h3,
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] small,
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] [data-testid="stCaptionContainer"]{
+    color:white !important;
+}
+
+/* Native navigation buttons */
+section[data-testid="stSidebar"] [data-testid="stButton"] button{
+    width:100% !important;
+    border-radius:10px !important;
+    min-height:44px !important;
+    font-weight:700 !important;
+    text-align:left !important;
+}
+section[data-testid="stSidebar"] [data-testid="stButton"] button[kind="secondary"]{
+    background:rgba(255,255,255,.08) !important;
+    color:white !important;
+    border:1px solid rgba(255,255,255,.08) !important;
+}
+section[data-testid="stSidebar"] [data-testid="stButton"] button[kind="secondary"] *{
+    color:white !important;
+}
+section[data-testid="stSidebar"] [data-testid="stButton"] button[kind="primary"]{
+    background:linear-gradient(90deg,#7669eb,#5f65e8) !important;
+    color:white !important;
+    border:none !important;
+}
+section[data-testid="stSidebar"] [data-testid="stButton"] button[kind="primary"] *{
+    color:white !important;
+}
+
+/* Main content should account for the real sidebar now.
+   Remove the old fake-sidebar 300px left padding. */
+.block-container{
+    max-width:1450px !important;
+    margin:0 auto !important;
+    padding:120px 34px 52px 34px !important;
+}
+
+/* Existing fixed class bar starts after the real sidebar */
+.class-bar{
+    left:270px !important;
+}
+
+/* Keep the old custom sidebar hidden if any remnants exist */
+.teacher-sidebar{
+    display:none !important;
+}
+
+@media(max-width:900px){
+    section[data-testid="stSidebar"]{
+        width:235px !important;
+        min-width:235px !important;
+        max-width:235px !important;
+    }
+    .class-bar{
+        left:235px !important;
+    }
+}
+</style>
+""", unsafe_allow_html=True)
 
