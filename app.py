@@ -2904,12 +2904,105 @@ elif page=="Scholar Profile":
 
 elif page=="Scholar Binder":
     st.markdown('<div class="page-title">Grades</div><div class="page-subtitle">Assignments, gradebook, standards, NWEA/F&P, and grade settings.</div>',unsafe_allow_html=True)
+
+    # Grades is always visible, even before a class or scholar has been added.
+    binder_tool=st.radio(
+        "Gradebook Section",
+        ["Overview","Add Assignment","Skills & Standards","Work Samples","NWEA & F&P","Grade Settings"],
+        horizontal=True,
+        key="class_binder_tool"
+    )
+
     if not selected_class:
-        st.info("Choose a class from the Binder Cover first.")
+        st.caption("No class is selected yet. This section is ready now; class and scholar data will populate here automatically once you add them.")
+
+        if binder_tool=="Overview":
+            st.markdown("## Class Gradebook Overview")
+            p1,p2=st.columns(2)
+            p1.selectbox("Subject",["All Subjects","ELA","Math","Science","Social Studies"],key="preview_grid_subject",disabled=True)
+            p2.selectbox("Sort assignments by",["Oldest → Newest","Newest → Oldest","Subject","Standard Code"],key="preview_grid_sort",disabled=True)
+
+            preview_df=pd.DataFrame(columns=["Scholar"])
+            st.dataframe(preview_df,hide_index=True,use_container_width=True,height=300)
+            st.info("Scholar names and assignment columns will appear in this gradebook automatically after a class and roster are added.")
+
+            st.markdown("### Printable / Uploadable Excel Grade Sheet")
+            st.caption("The download and import tools will activate once a class exists.")
+            st.button("⬇️ Download Excel Grade Sheet",disabled=True,key="preview_download_grade_sheet")
+
+            st.markdown("---")
+            st.markdown("### 📸 Import Grades from NHA Screenshot")
+            st.caption("Screenshot grade import will activate once a class and at least one assignment exist.")
+            st.file_uploader("Upload NHA gradebook screenshot(s)",type=["png","jpg","jpeg"],disabled=True,key="preview_nha_upload")
+
+        elif binder_tool=="Add Assignment":
+            st.markdown("## Add Assignment")
+            st.caption("You can see the assignment setup now. Saving will activate once a class exists.")
+            a,b=st.columns(2)
+            a.text_input("Assignment title",disabled=True,key="preview_assignment_title")
+            b.selectbox("Grade category",list(get_setting("weights").keys()),disabled=True,key="preview_assignment_category")
+            c,d=st.columns(2)
+            c.selectbox("Subject",["ELA","Math","Science","Social Studies"],disabled=True,key="preview_assignment_subject")
+            d.number_input("Points Possible",min_value=1.0,value=100.0,disabled=True,key="preview_assignment_points")
+            st.selectbox("Skill / Standard",["Select a class first"],disabled=True,key="preview_assignment_standard")
+            st.date_input("Assignment Date",value=date.today(),disabled=True,key="preview_assignment_date")
+            st.button("Create Assignment",disabled=True,key="preview_create_assignment")
+
+        elif binder_tool=="Skills & Standards":
+            st.markdown("## Skills & Standards")
+            st.caption("Standards are available even before a roster is added.")
+            preview_subject=st.selectbox(
+                "Subject",
+                ["Science","Social Studies"],
+                key="preview_standard_subject"
+            )
+            sdf=standards_df(preview_subject)
+            if sdf.empty:
+                st.info("No standards are saved for this subject yet.")
+            else:
+                st.dataframe(
+                    sdf[[c for c in ["code","skill","description"] if c in sdf.columns]],
+                    hide_index=True,use_container_width=True
+                )
+            st.caption("Scholar skill performance will appear here after grades are entered.")
+
+        elif binder_tool=="Work Samples":
+            st.markdown("## Work Samples")
+            st.file_uploader("Upload Scholar Work",disabled=True,key="preview_work_sample")
+            st.info("The scholar selector and saved work samples will appear here after a roster is added.")
+
+        elif binder_tool=="NWEA & F&P":
+            st.markdown("## NWEA & F&P")
+            n1,n2=st.columns(2)
+            with n1:
+                st.markdown("### NWEA")
+                st.caption("NWEA fields and scholar rows will populate after scholars are added.")
+                st.dataframe(pd.DataFrame(columns=["Scholar","Reading","Math"]),hide_index=True,use_container_width=True)
+            with n2:
+                st.markdown("### F&P")
+                st.caption("F&P reading levels will populate after scholars are added.")
+                st.dataframe(pd.DataFrame(columns=["Scholar","F&P Level"]),hide_index=True,use_container_width=True)
+
+        elif binder_tool=="Grade Settings":
+            st.markdown("## Grade Settings")
+            st.caption("These settings are available before a class exists.")
+            weights=get_setting("weights") or {}
+            if weights:
+                st.dataframe(
+                    pd.DataFrame([{"Category":k,"Weight %":v} for k,v in weights.items()]),
+                    hide_index=True,use_container_width=True
+                )
+            scale=get_setting("scale") or []
+            if scale:
+                st.markdown("### Grade Scale")
+                st.dataframe(
+                    pd.DataFrame(scale,columns=["Grade","Minimum","Maximum"]),
+                    hide_index=True,use_container_width=True
+                )
+
     else:
         class_name=folder.get(selected_class,"Selected Class")
         st.markdown(f"### 📌 {class_name}")
-        binder_tool=st.radio("Binder Page",["Overview","Add Assignment","Skills & Standards","Work Samples","NWEA & F&P","Grade Settings"],horizontal=True,key="class_binder_tool")
 
         if binder_tool=="Overview":
             st.markdown("## Class Gradebook Overview")
@@ -3312,7 +3405,6 @@ elif page=="Scholar Binder":
             se=st.data_editor(sc,num_rows="dynamic",hide_index=True,use_container_width=True,key="scale_v9")
             if st.button("Save Letter Scale",key="save_scale_v9"):
                 save_setting("scale",[[str(r.Letter),float(r.Minimum),float(r.Maximum)] for _,r in se.iterrows()]); st.success("Saved.")
-
 elif page=="Book Leveler":
     st.markdown('<div class="page-title">Book Leveler</div><div class="page-subtitle">Search books online, save verified F&P levels, and check fit for a scholar.</div>',unsafe_allow_html=True)
     if not selected_class:
