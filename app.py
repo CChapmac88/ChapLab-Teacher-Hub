@@ -250,30 +250,16 @@ def cloud_download_database(target):
     target.write_bytes(data)
     return True
 
-@st.cache_resource
 def prepare_database():
-    """
-    Startup rule:
-    - Try cloud briefly.
-    - Never let cloud hold the app on a loading spinner.
-    - If there is no cloud DB yet, open a fresh local web DB immediately.
-    """
-    if not cloud_configured():
-        return str(LEGACY_DB)
-
-    # One bounded download attempt. All network calls above have hard timeouts.
-    if cloud_download_database(WEB_DB):
+    """Open ChapLab immediately. Cloud is never contacted during startup."""
+    if WEB_DB.exists():
         return str(WEB_DB)
-
-    # If an old bundled DB exists, use a copy of it. Do NOT wait for upload here.
     if LEGACY_DB.exists():
         try:
             shutil.copy2(LEGACY_DB,WEB_DB)
+            return str(WEB_DB)
         except Exception:
-            pass
-        return str(WEB_DB if WEB_DB.exists() else LEGACY_DB)
-
-    # Fresh web install: SQLite will create this immediately in init_db().
+            return str(LEGACY_DB)
     return str(WEB_DB)
 
 DB = prepare_database()
@@ -413,10 +399,7 @@ input,textarea,[data-baseweb="select"]>div{background:#f7f9fc!important}
 # ---------- Database ----------
 class ChapLabConnection(sqlite3.Connection):
     def commit(self):
-        result=super().commit()
-        if cloud_configured():
-            _background_cloud_upload(DB)
-        return result
+        return super().commit()
 
 def conn():
     c=sqlite3.connect(DB,factory=ChapLabConnection)
@@ -1193,31 +1176,19 @@ def save_teacher_name(name):
 
 def teacher_dashboard_info():
     c=conn()
-    defaults={
+    out={
         "display_name":get_teacher_name() or "Ms. Chapman",
-        "grade_title":"",
-        "homeroom":"",
-        "school":"",
-        "subjects":[],
-        "tagline":"",
-        "show_grade_title":True,
-        "show_homeroom":True,
-        "show_school":True,
-        "show_subjects":True,
-        "show_tagline":True,
+        "grade_title":"", "homeroom":"", "school":"", "subjects":[], "tagline":"",
+        "show_grade_title":True, "show_homeroom":True, "show_school":True,
+        "show_subjects":True, "show_tagline":True
     }
     key_map={
-        "teacher_display_name":"display_name",
-        "teacher_grade_title":"grade_title",
-        "teacher_homeroom":"homeroom",
-        "teacher_school":"school",
-        "teacher_subjects":"subjects",
-        "teacher_tagline":"tagline",
-        "teacher_show_grade_title":"show_grade_title",
-        "teacher_show_homeroom":"show_homeroom",
-        "teacher_show_school":"show_school",
-        "teacher_show_subjects":"show_subjects",
-        "teacher_show_tagline":"show_tagline",
+        "teacher_display_name":"display_name", "teacher_grade_title":"grade_title",
+        "teacher_homeroom":"homeroom", "teacher_school":"school",
+        "teacher_subjects":"subjects", "teacher_tagline":"tagline",
+        "teacher_show_grade_title":"show_grade_title", "teacher_show_homeroom":"show_homeroom",
+        "teacher_show_school":"show_school", "teacher_show_subjects":"show_subjects",
+        "teacher_show_tagline":"show_tagline"
     }
     for db_key,out_key in key_map.items():
         r=c.execute("SELECT value FROM settings WHERE key=?",(db_key,)).fetchone()
@@ -1225,38 +1196,32 @@ def teacher_dashboard_info():
             continue
         try:
             val=json.loads(r["value"])
-        except:
+        except Exception:
             val=r["value"]
         if out_key=="subjects":
-            defaults[out_key]=val if isinstance(val,list) else []
+            out[out_key]=val if isinstance(val,list) else []
         elif out_key.startswith("show_"):
-            defaults[out_key]=bool(val)
+            out[out_key]=bool(val)
         else:
-            defaults[out_key]=str(val or "")
+            out[out_key]=str(val or "")
     c.close()
-    return defaults
+    return out
 
 def save_teacher_dashboard_info(display_name, grade_title, homeroom, school, subjects, tagline,
                                 show_grade_title=True, show_homeroom=True, show_school=True,
                                 show_subjects=True, show_tagline=True):
     display_name=str(display_name or "").strip() or "Teacher"
     c=conn()
-    values={
-        "teacher_display_name":display_name,
-        "teacher_grade_title":str(grade_title or "").strip(),
-        "teacher_homeroom":str(homeroom or "").strip(),
-        "teacher_school":str(school or "").strip(),
-        "teacher_subjects":list(subjects or []),
-        "teacher_tagline":str(tagline or "").strip(),
-        "teacher_show_grade_title":bool(show_grade_title),
-        "teacher_show_homeroom":bool(show_homeroom),
-        "teacher_show_school":bool(show_school),
-        "teacher_show_subjects":bool(show_subjects),
-        "teacher_show_tagline":bool(show_tagline),
+    vals={
+        "teacher_display_name":display_name, "teacher_grade_title":str(grade_title or "").strip(),
+        "teacher_homeroom":str(homeroom or "").strip(), "teacher_school":str(school or "").strip(),
+        "teacher_subjects":list(subjects or []), "teacher_tagline":str(tagline or "").strip(),
+        "teacher_show_grade_title":bool(show_grade_title), "teacher_show_homeroom":bool(show_homeroom),
+        "teacher_show_school":bool(show_school), "teacher_show_subjects":bool(show_subjects),
+        "teacher_show_tagline":bool(show_tagline)
     }
-    for key,val in values.items():
-        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)",(key,json.dumps(val)))
-    # Keep the original teacher_name setting synchronized with the banner display name.
+    for k,v in vals.items():
+        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)",(k,json.dumps(v)))
     c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES ('teacher_name',?)",(json.dumps(display_name),))
     c.commit(); c.close()
 
@@ -2312,12 +2277,8 @@ if records:
         cid=int(item["id"])
         cname=item["class_name"]
         with col:
-            if st.button(
-                cname,
-                key=f"chaplab_class_{cid}",
-                use_container_width=True,
-                type="primary" if cid==selected_class else "secondary"
-            ):
+            if st.button(cname,key=f"chaplab_class_{cid}",use_container_width=True,
+                         type="primary" if cid==selected_class else "secondary"):
                 st.session_state["selected_class"]=cid
                 st.session_state["nav_page"]="Class Dashboard"
                 st.session_state["class_binder_tool"]="Overview"
@@ -2325,113 +2286,67 @@ if records:
 
 profile=teacher_dashboard_info()
 display_name=profile.get("display_name") or get_teacher_name() or "Ms. Chapman"
-
-# Build the optional detail line shown inside the Teacher Hub Banner.
-banner_bits=[]
+bits=[]
 if profile.get("show_grade_title") and profile.get("grade_title"):
-    banner_bits.append(f"🍎 {html.escape(profile['grade_title'])}")
+    bits.append(f"🍎 {html.escape(profile['grade_title'])}")
 if profile.get("show_homeroom") and profile.get("homeroom"):
-    banner_bits.append(f"🏫 Homeroom {html.escape(profile['homeroom'])}")
+    bits.append(f"🏫 Homeroom {html.escape(profile['homeroom'])}")
 if profile.get("show_school") and profile.get("school"):
-    banner_bits.append(f"🏛️ {html.escape(profile['school'])}")
+    bits.append(f"🏛️ {html.escape(profile['school'])}")
 if profile.get("show_subjects") and profile.get("subjects"):
-    banner_bits.append("📚 "+html.escape(" · ".join(profile["subjects"])))
+    bits.append("📚 "+html.escape(" · ".join(profile["subjects"])))
 if profile.get("show_tagline") and profile.get("tagline"):
-    banner_bits.append("💜 "+html.escape(profile["tagline"]))
-banner_detail=" &nbsp;&nbsp;|&nbsp;&nbsp; ".join(banner_bits)
+    bits.append("💜 "+html.escape(profile["tagline"]))
+detail=" &nbsp;&nbsp;|&nbsp;&nbsp; ".join(bits) or "Your personalized teacher workspace"
 
 with st.container(border=True):
-    bc1,bc2=st.columns([5,1])
-    with bc1:
+    b1,b2=st.columns([5,1])
+    with b1:
         st.markdown(
-            f"""
-            <div class="teacher-hub-banner">
-              <div class="teacher-hub-banner-title">{html.escape(display_name)}’s Teacher Hub</div>
-              <div class="teacher-hub-banner-details">{banner_detail or "Your personalized teacher workspace"}</div>
-            </div>
-            """,
+            f"<div class='teacher-hub-banner'><div class='teacher-hub-banner-title'>{html.escape(display_name)}'s Teacher Hub</div><div class='teacher-hub-banner-details'>{detail}</div></div>",
             unsafe_allow_html=True
         )
-    with bc2:
+    with b2:
         st.write("")
-        if st.button("⚙️ Profile Settings",key="open_teacher_profile_settings",use_container_width=True):
+        if st.button("⚙️ Profile Settings",key="profile_settings_toggle",use_container_width=True):
             st.session_state["show_teacher_profile_settings"]=not st.session_state.get("show_teacher_profile_settings",False)
             st.rerun()
-
     if st.session_state.get("show_teacher_profile_settings",False):
         st.markdown("#### Customize Your Teacher Hub Banner")
-        st.caption("Choose what information appears in your banner. Leaving a field blank keeps it off the banner.")
-
-        pr1,pr2=st.columns(2)
-        p_display=pr1.text_input("Display name",value=profile.get("display_name",""),key="profile_display_name")
-        p_grade=pr2.text_input("Grade / teacher title",value=profile.get("grade_title",""),placeholder="Example: 3rd Grade Teacher",key="profile_grade_title")
-
-        pr3,pr4=st.columns(2)
-        p_home=pr3.text_input("Homeroom",value=profile.get("homeroom",""),placeholder="Example: 3-208",key="profile_homeroom")
-        p_school=pr4.text_input("School",value=profile.get("school",""),placeholder="Example: Brooklyn Scholars Charter School",key="profile_school")
-
-        p_subjects=st.multiselect(
-            "Subjects",
-            ["ELA","Math","Science","Social Studies","Grammar","Writing"],
-            default=[s for s in profile.get("subjects",[]) if s in ["ELA","Math","Science","Social Studies","Grammar","Writing"]],
-            key="profile_subjects"
-        )
-        p_tagline=st.text_input(
-            "Custom line / tagline",
-            value=profile.get("tagline",""),
-            placeholder="Example: Passionate • Organized • Student Focused",
-            key="profile_tagline"
-        )
-
+        p1,p2=st.columns(2)
+        pn=p1.text_input("Display name",value=profile.get("display_name",""),key="prof_name")
+        pg=p2.text_input("Grade / teacher title",value=profile.get("grade_title",""),placeholder="Example: 3rd Grade Teacher",key="prof_grade")
+        p3,p4=st.columns(2)
+        ph=p3.text_input("Homeroom",value=profile.get("homeroom",""),placeholder="Example: 3-208",key="prof_home")
+        ps=p4.text_input("School",value=profile.get("school",""),key="prof_school")
+        psub=st.multiselect("Subjects",["ELA","Math","Science","Social Studies","Grammar","Writing"],
+                            default=[s for s in profile.get("subjects",[]) if s in ["ELA","Math","Science","Social Studies","Grammar","Writing"]],key="prof_subjects")
+        pt=st.text_input("Custom line / tagline",value=profile.get("tagline",""),key="prof_tagline")
         st.markdown("**Show in Teacher Hub Banner**")
-        sh1,sh2,sh3,sh4,sh5=st.columns(5)
-        show_grade=sh1.checkbox("Grade/title",value=profile.get("show_grade_title",True),key="profile_show_grade")
-        show_home=sh2.checkbox("Homeroom",value=profile.get("show_homeroom",True),key="profile_show_home")
-        show_school=sh3.checkbox("School",value=profile.get("show_school",True),key="profile_show_school")
-        show_subjects=sh4.checkbox("Subjects",value=profile.get("show_subjects",True),key="profile_show_subjects")
-        show_tagline=sh5.checkbox("Tagline",value=profile.get("show_tagline",True),key="profile_show_tagline")
+        q1,q2,q3,q4,q5=st.columns(5)
+        sg=q1.checkbox("Grade/title",value=profile.get("show_grade_title",True),key="prof_show_grade")
+        sh=q2.checkbox("Homeroom",value=profile.get("show_homeroom",True),key="prof_show_home")
+        ss=q3.checkbox("School",value=profile.get("show_school",True),key="prof_show_school")
+        su=q4.checkbox("Subjects",value=profile.get("show_subjects",True),key="prof_show_subjects")
+        stg=q5.checkbox("Tagline",value=profile.get("show_tagline",True),key="prof_show_tagline")
+        c1,c2=st.columns(2)
+        if c1.button("💾 Save Profile",type="primary",key="prof_save",use_container_width=True):
+            save_teacher_dashboard_info(pn,pg,ph,ps,psub,pt,sg,sh,ss,su,stg)
+            st.session_state["show_teacher_profile_settings"]=False
+            st.rerun()
+        if c2.button("Cancel",key="prof_cancel",use_container_width=True):
+            st.session_state["show_teacher_profile_settings"]=False
+            st.rerun()
 
-        save_col,close_col=st.columns([1,1])
-        with save_col:
-            if st.button("💾 Save Profile",type="primary",key="save_teacher_profile",use_container_width=True):
-                save_teacher_dashboard_info(
-                    p_display,p_grade,p_home,p_school,p_subjects,p_tagline,
-                    show_grade,show_home,show_school,show_subjects,show_tagline
-                )
-                st.session_state["show_teacher_profile_settings"]=False
-                st.success("Teacher Hub Banner updated.")
-                st.rerun()
-        with close_col:
-            if st.button("Cancel",key="cancel_teacher_profile",use_container_width=True):
-                st.session_state["show_teacher_profile_settings"]=False
-                st.rerun()
-
-# Navigation sits directly beneath the Teacher Hub Banner.
-_nav_labels=[
-    ("🏠 Dashboard","Home Page"),
-    ("🎓 Scholars","Scholars"),
-    ("Ⓐ Grades","Scholar Binder"),
-    ("📚 Book Leveler","Book Leveler"),
-    ("👥 Student Grouping","Student Grouping"),
-    ("📝 Report Comments","Report Card Comments"),
-    ("✨ Little Assistant","Little Assistant"),
-    ("💬 Communication","Communication Log"),
-    ("⚙️ Web & Backup","Web & Backup"),
-]
-_nav_cols=st.columns(9)
-for col,(label,target) in zip(_nav_cols,_nav_labels):
+_nav=[("🏠 Dashboard","Home Page"),("🎓 Scholars","Scholars"),("Ⓐ Grades","Scholar Binder"),("📚 Book Leveler","Book Leveler"),("👥 Student Grouping","Student Grouping"),("📝 Report Comments","Report Card Comments"),("✨ Little Assistant","Little Assistant"),("💬 Communication","Communication Log"),("⚙️ Web & Backup","Web & Backup")]
+cols=st.columns(9)
+for col,(label,target) in zip(cols,_nav):
     with col:
-        if st.button(
-            label,
-            key=f"top_nav_{target}",
-            use_container_width=True,
-            type="primary" if page==target else "secondary"
-        ):
+        if st.button(label,key=f"topnav_{target}",use_container_width=True,type="primary" if page==target else "secondary"):
             st.session_state["nav_page"]=target
             if target=="Scholar Binder":
                 st.session_state["class_binder_tool"]="Overview"
             st.rerun()
-
 st.markdown("---")
 
 # ---------- Pages ----------
@@ -4799,68 +4714,13 @@ section[data-testid="stSidebar"] [data-testid="stButton"] button[kind="primary"]
 
 st.markdown("""
 <style>
-/* ==========================================================
-   ChapLab v4.0.7 — Teacher Hub Banner + Top Navigation
-   ========================================================== */
-
-/* No sidebar: use full app width */
-section[data-testid="stSidebar"],
-[data-testid="collapsedControl"]{
-    display:none !important;
-}
-.block-container,
-[data-testid="stMain"] .block-container{
-    max-width:1500px !important;
-    width:100% !important;
-    margin:0 auto !important;
-    padding:36px 30px 60px !important;
-    box-sizing:border-box !important;
-}
-
-/* Disable obsolete fixed fake sidebar/class-bar spacing */
-.teacher-sidebar{display:none !important;}
-.class-bar{position:static !important;left:auto !important;right:auto !important;top:auto !important;}
-
-/* Teacher Hub Banner */
-.teacher-hub-banner{
-    min-height:100px;
-    display:flex;
-    flex-direction:column;
-    justify-content:center;
-    padding:8px 8px 8px 10px;
-}
-.teacher-hub-banner-title{
-    font-family:"Comic Sans MS","Segoe Print",cursive;
-    font-size:clamp(28px,3.4vw,48px);
-    font-weight:900;
-    color:#26344b;
-    line-height:1.08;
-    margin-bottom:14px;
-}
-.teacher-hub-banner-details{
-    color:#5e6674;
-    font-size:15px;
-    line-height:1.7;
-    overflow-wrap:anywhere;
-}
-.accent-page-label{
-    display:inline-block;
-    margin:6px 0 18px;
-    background:#c5a8e6;
-    color:#253044;
-    padding:7px 18px 9px;
-    border-radius:8px;
-    font-family:"Comic Sans MS","Segoe Print",cursive;
-    font-weight:800;
-}
-
-/* Make the 9 top nav buttons compact but readable */
-[data-testid="stHorizontalBlock"] [data-testid="stButton"] button{
-    min-height:46px;
-}
-@media(max-width:1200px){
-    .teacher-hub-banner-title{font-size:34px;}
-}
+section[data-testid="stSidebar"],[data-testid="collapsedControl"]{display:none!important;}
+.block-container,[data-testid="stMain"] .block-container{max-width:1500px!important;width:100%!important;margin:0 auto!important;padding:34px 28px 60px!important;box-sizing:border-box!important;}
+.teacher-sidebar{display:none!important}.class-bar{position:static!important;left:auto!important;right:auto!important;top:auto!important}
+.teacher-hub-banner{min-height:92px;display:flex;flex-direction:column;justify-content:center;padding:8px 10px}
+.teacher-hub-banner-title{font-family:"Comic Sans MS","Segoe Print",cursive;font-size:clamp(28px,3.2vw,46px);font-weight:900;color:#26344b;line-height:1.08;margin-bottom:12px}
+.teacher-hub-banner-details{color:#5e6674;font-size:15px;line-height:1.65;overflow-wrap:anywhere}
+.accent-page-label{display:inline-block;margin:6px 0 18px;background:#c5a8e6;color:#253044;padding:7px 18px 9px;border-radius:8px;font-family:"Comic Sans MS","Segoe Print",cursive;font-weight:800}
 </style>
-""", unsafe_allow_html=True)
+""",unsafe_allow_html=True)
 
