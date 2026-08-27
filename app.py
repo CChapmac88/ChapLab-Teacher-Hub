@@ -26,6 +26,33 @@ except Exception:
 
 st.set_page_config(page_title="ChapLab Teacher Hub", page_icon="📘", layout="wide", initial_sidebar_state="expanded")
 
+
+st.markdown("""
+<style>
+/* ChapLab Book Scanner — mirrored live camera preview on phone + computer.
+   This affects only the visual preview. Captured image bytes stay unmirrored. */
+[data-testid="stCameraInput"] video,
+[data-testid="stCameraInput"] canvas,
+[data-testid="stCameraInput"] img {
+    transform: scaleX(-1) !important;
+    transform-origin: center center !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+st.markdown("""
+<style>
+/* Custom rear-camera component host video, when exposed in the Streamlit DOM. */
+iframe[title*="streamlit_back_camera_input" i] + div video,
+div[data-testid="stCustomComponentV1"] video,
+div[data-testid="stCustomComponent"] video {
+    transform: scaleX(-1) !important;
+    transform-origin: center center !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 st.markdown("""
 <style>
 section[data-testid="stSidebar"]{
@@ -5348,11 +5375,34 @@ elif page=="Book Leveler":
             key="book_identify_mode"
         )
 
+        def clear_book_scanner():
+            """Clear current book/scan state so the next book starts cleanly."""
+            for k in (
+                "book_camera_isbn",
+                "book_camera_manual_correction",
+                "book_online_query",
+                "book_online_results",
+                "_book_scan_message",
+                "_book_scan_error",
+                "_last_camera_scan_token",
+                "book_isbn_camera_capture_fallback",
+            ):
+                st.session_state.pop(k,None)
+            st.session_state["book_online_search_mode"]="ISBN"
+
         if identify_mode=="Camera":
-            st.markdown("#### 📷 Rear Camera Scanner")
+            st.markdown('<div class="chaplab-mirrored-camera"></div>', unsafe_allow_html=True)
+            scan_title_col,scan_clear_col=st.columns([3,1])
+            with scan_title_col:
+                st.markdown("#### 📷 Rear Camera Scanner")
+            with scan_clear_col:
+                if st.button("🧹 Clear / Scan New Book",key="clear_camera_book",use_container_width=True):
+                    clear_book_scanner()
+                    st.rerun()
             st.info(
-                "On phones, ChapLab now requests the **rear/environment camera only** for book scanning. "
-                "There is no front-camera option in this scanner."
+                "ChapLab uses the **rear/environment camera on phones** and mirrors the live preview on both "
+                "**phones and computers** so positioning feels natural. The captured barcode image itself stays "
+                "normal for accurate ISBN decoding."
             )
             st.caption(
                 "Hold the phone about 8–14 inches from the book. Keep the entire ISBN barcode in the center. "
@@ -5455,13 +5505,17 @@ elif page=="Book Leveler":
                 placeholder="978...",
                 key="book_camera_manual_correction"
             )
+            if st.session_state.get("book_camera_isbn"):
+                st.caption("Ready for another book? Use **Clear / Scan New Book** above to reset the ISBN, result, and camera capture.")
             if st.button("Use This ISBN",key="use_camera_manual_isbn"):
                 cleaned=re.sub(r"[^0-9Xx]","",manual_cam or "")
                 if len(cleaned) not in (10,13):
                     st.warning("Enter a valid 10- or 13-digit ISBN.")
                 else:
                     st.session_state["book_camera_isbn"]=cleaned
-                    st.session_state["book_camera_manual_correction"]=cleaned
+                    # Do not write book_camera_manual_correction here:
+                    # that keyed text_input already exists in this run.
+                    # The box already contains manual_cam; synchronization occurs safely on rerun.
                     st.session_state["book_online_search_mode"]="ISBN"
                     st.session_state["book_online_query"]=cleaned
                     try:
