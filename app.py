@@ -1,5 +1,6 @@
 
 import streamlit as st
+import streamlit.components.v1 as components
 import sqlite3, json, os, re, tempfile, shutil, threading
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -2657,6 +2658,15 @@ def lookup_and_store_isbn(isbn):
     if found:
         return True, f"ISBN {cleaned} found."
     return False, f"ISBN {cleaned} was read correctly, but no matching Open Library book was found."
+
+@st.cache_resource
+def _chaplab_barcode_component():
+    component_path=Path(__file__).parent/"chaplab_live_barcode_component"
+    return components.declare_component("chaplab_live_barcode", path=str(component_path))
+
+def chaplab_live_barcode_scanner(key):
+    component=_chaplab_barcode_component()
+    return component(key=key, default="")
 
 def openlibrary_search_books(query, limit=8):
     """Search Open Library by title, author, ISBN, or keywords."""
@@ -5436,89 +5446,64 @@ elif page=="Book Leveler":
                     st.rerun()
 
             st.info(
-                "Point the camera at the book's **ISBN barcode**. There is no photo-capture step — "
-                "ChapLab reads the live camera feed and searches for the book automatically."
+                "Choose **Front Camera** or **Back Camera** inside the scanner. "
+                "The live preview is mirrored so it is easier to position the book."
             )
             st.caption(
-                "The live scanner view is shown normally — **not mirrored** — so the barcode stays in its natural orientation."
+                "Only the preview is mirrored. ChapLab decodes the original camera frame, "
+                "so the ISBN result itself is not reversed."
             )
 
-            live_scanner=None
-            live_error=None
-            try:
-                from streamlit_qrcode_scanner import qrcode_scanner
-                live_scanner=qrcode_scanner
-            except Exception as e:
-                live_error=str(e)
+            nonce=int(st.session_state.get("book_live_scanner_nonce",0))
+            scanned_value=chaplab_live_barcode_scanner(
+                key=f"chaplab_live_barcode_{nonce}"
+            )
 
-            if live_scanner is None:
-                st.error(
-                    "The live scanner could not start. Make sure requirements.txt from this version was deployed."
-                )
-                if live_error:
-                    st.caption(live_error)
-            else:
-                nonce=int(st.session_state.get("book_live_scanner_nonce",0))
-                st.markdown(
-                    """
-                    <div style="
-                        max-width:560px;margin:0 auto 8px auto;
-                        border:2px dashed #ff4b4b;border-radius:14px;
-                        padding:9px 12px;text-align:center;
-                        background:rgba(255,75,75,.05);font-weight:700;">
-                        Keep the full 978 / 979 ISBN barcode in the camera view
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
+            if scanned_value:
+                raw_value=str(scanned_value).strip()
+                cleaned=re.sub(r"[^0-9Xx]","",raw_value)
 
-                scanned_value=live_scanner(key=f"book_live_isbn_scanner_{nonce}")
+                if raw_value!=st.session_state.get("_last_live_scanned_value"):
+                    st.session_state["_last_live_scanned_value"]=raw_value
 
-                if scanned_value:
-                    raw_value=str(scanned_value).strip()
-                    cleaned=re.sub(r"[^0-9Xx]","",raw_value)
+                    if len(cleaned) in (10,13):
+                        st.session_state["book_camera_isbn"]=cleaned
+                        st.session_state["book_camera_manual_correction"]=cleaned
+                        st.session_state["book_online_search_mode"]="ISBN"
+                        st.session_state["book_online_query"]=cleaned
+                        st.session_state["_last_autolookup_isbn"]=cleaned
 
-                    if raw_value!=st.session_state.get("_last_live_scanned_value"):
-                        st.session_state["_last_live_scanned_value"]=raw_value
-
-                        if len(cleaned) in (10,13):
-                            st.session_state["book_camera_isbn"]=cleaned
-                            st.session_state["book_camera_manual_correction"]=cleaned
-                            st.session_state["book_online_search_mode"]="ISBN"
-                            st.session_state["book_online_query"]=cleaned
-                            st.session_state["_last_autolookup_isbn"]=cleaned
-
-                            try:
-                                found=openlibrary_lookup_isbn(cleaned)
-                                st.session_state["book_online_results"]=[found] if found else []
-                                if found:
-                                    st.session_state["book_selected_result_idx"]=0
-                                    st.session_state["book_selected_result"]=found
-                                    st.session_state["_book_scan_message"]=(
-                                        f"✅ ISBN **{cleaned}** detected live. "
-                                        f"**{found.get('title','Book')}** loaded automatically."
-                                    )
-                                else:
-                                    st.session_state["book_selected_result_idx"]=None
-                                    st.session_state["book_selected_result"]=None
-                                    st.session_state["_book_scan_message"]=(
-                                        f"✅ ISBN **{cleaned}** detected live, but no matching book was found. "
-                                        "Correct the ISBN below if the scan looks wrong."
-                                    )
-                            except Exception as e:
-                                st.session_state["book_online_results"]=[]
+                        try:
+                            found=openlibrary_lookup_isbn(cleaned)
+                            st.session_state["book_online_results"]=[found] if found else []
+                            if found:
+                                st.session_state["book_selected_result_idx"]=0
+                                st.session_state["book_selected_result"]=found
+                                st.session_state["_book_scan_message"]=(
+                                    f"✅ ISBN **{cleaned}** detected live. "
+                                    f"**{found.get('title','Book')}** loaded automatically."
+                                )
+                            else:
                                 st.session_state["book_selected_result_idx"]=None
                                 st.session_state["book_selected_result"]=None
                                 st.session_state["_book_scan_message"]=(
-                                    f"✅ ISBN **{cleaned}** detected live. Lookup could not complete: {e}"
+                                    f"✅ ISBN **{cleaned}** detected live, but no matching book was found. "
+                                    "Correct the ISBN below if the scan looks wrong."
                                 )
-                            st.rerun()
-                        else:
-                            st.session_state["_book_scan_error"]=(
-                                f"The camera read `{raw_value}`, but it is not a 10- or 13-digit ISBN. "
-                                "Keep the book's 978/979 barcode in view."
+                        except Exception as e:
+                            st.session_state["book_online_results"]=[]
+                            st.session_state["book_selected_result_idx"]=None
+                            st.session_state["book_selected_result"]=None
+                            st.session_state["_book_scan_message"]=(
+                                f"✅ ISBN **{cleaned}** detected live. Lookup could not complete: {e}"
                             )
-                            st.rerun()
+                        st.rerun()
+                    else:
+                        st.session_state["_book_scan_error"]=(
+                            f"The camera read `{raw_value}`, but it is not a 10- or 13-digit ISBN. "
+                            "Keep the book's ISBN barcode inside the guide."
+                        )
+                        st.rerun()
 
             if st.session_state.get("_book_scan_error"):
                 st.warning(st.session_state.pop("_book_scan_error"))
@@ -5542,6 +5527,7 @@ elif page=="Book Leveler":
                 st.session_state["book_online_search_mode"]="ISBN"
                 st.session_state["book_online_query"]=cleaned
                 st.session_state["_last_autolookup_isbn"]=cleaned
+
                 try:
                     found=openlibrary_lookup_isbn(cleaned)
                     st.session_state["book_online_results"]=[found] if found else []

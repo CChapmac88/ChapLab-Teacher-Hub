@@ -10,4 +10,3 @@ supabase>=2.0,<3
 pypdf>=5.0
 zxing-cpp>=2.2
 opencv-python-headless>=4.10
-streamlit-qrcode-scanner==0.1.2
