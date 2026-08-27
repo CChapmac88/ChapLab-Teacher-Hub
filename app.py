@@ -31,35 +31,6 @@ st.set_page_config(page_title="ChapLab Teacher Hub", page_icon="📘", layout="w
 
 st.markdown("""
 <style>
-/* ChapLab Book Scanner — compact mirrored live preview.
-   Visual preview is mirrored; captured image bytes remain normal. */
-[data-testid="stCameraInput"]{
-    max-width:560px !important;
-    margin:0 auto !important;
-}
-[data-testid="stCameraInput"] video{
-    transform:scaleX(-1) !important;
-    transform-origin:center center !important;
-    max-height:340px !important;
-    width:100% !important;
-    object-fit:cover !important;
-    border-radius:16px !important;
-}
-[data-testid="stCameraInput"] canvas,
-[data-testid="stCameraInput"] img{
-    transform:scaleX(-1) !important;
-    transform-origin:center center !important;
-    max-height:340px !important;
-    width:100% !important;
-    object-fit:contain !important;
-    border-radius:16px !important;
-}
-</style>
-""", unsafe_allow_html=True)
-
-
-st.markdown("""
-<style>
 section[data-testid="stSidebar"]{
     display:block !important;
     visibility:visible !important;
@@ -2661,12 +2632,12 @@ def lookup_and_store_isbn(isbn):
     return False, f"ISBN {cleaned} was read correctly, but no matching Open Library book was found."
 
 @st.cache_resource
-def _chaplab_barcode_component():
-    component_path=Path(__file__).parent/"chaplab_live_barcode_component"
-    return components.declare_component("chaplab_live_barcode", path=str(component_path))
+def _chaplab_auto_barcode_component():
+    component_path=Path(__file__).parent/"chaplab_auto_barcode_component"
+    return components.declare_component("chaplab_auto_barcode", path=str(component_path))
 
-def chaplab_live_barcode_scanner(key):
-    component=_chaplab_barcode_component()
+def chaplab_auto_barcode_scanner(key):
+    component=_chaplab_auto_barcode_component()
     return component(key=key, default="")
 
 def openlibrary_search_books(query, limit=8):
@@ -5679,24 +5650,21 @@ elif page=="Book Leveler":
         if identify_mode=="Camera":
             scan_title_col,scan_clear_col=st.columns([3,1])
             with scan_title_col:
-                st.markdown("#### 📷 Live ISBN Scanner")
+                st.markdown("#### 📷 Automatic ISBN Scanner")
             with scan_clear_col:
                 if st.button("🧹 Clear / Scan New Book",key="clear_camera_book",use_container_width=True):
                     clear_book_scanner()
                     st.rerun()
 
             st.info(
-                "Choose **Front Camera** or **Back Camera** inside the scanner. "
-                "The live preview is mirrored so it is easier to position the book."
+                "Choose **Front Camera** or **Back Camera** and hold the book's ISBN barcode inside the guide. "
+                "ChapLab detects the barcode automatically — no tapping and no photo button."
             )
-            st.caption(
-                "Only the preview is mirrored. ChapLab decodes the original camera frame, "
-                "so the ISBN result itself is not reversed."
-            )
+            st.caption("The camera preview is shown normally, not mirrored.")
 
             nonce=int(st.session_state.get("book_live_scanner_nonce",0))
-            scanned_value=chaplab_live_barcode_scanner(
-                key=f"chaplab_live_barcode_{nonce}"
+            scanned_value=chaplab_auto_barcode_scanner(
+                key=f"chaplab_auto_barcode_{nonce}"
             )
 
             if scanned_value:
@@ -5713,8 +5681,7 @@ elif page=="Book Leveler":
                         st.rerun()
                     else:
                         st.session_state["_book_scan_error"]=(
-                            f"The camera read `{raw_value}`, but it is not a 10- or 13-digit ISBN. "
-                            "Keep the book's ISBN barcode inside the guide."
+                            f"The camera read `{raw_value}`, but it is not a 10- or 13-digit ISBN."
                         )
                         st.rerun()
 
@@ -5747,8 +5714,8 @@ elif page=="Book Leveler":
 
             if st.session_state.get("book_camera_isbn"):
                 st.caption(
-                    "The live scan already searched for the book. If the wrong book appears, "
-                    "correct the ISBN here and ChapLab automatically searches again."
+                    "ChapLab automatically searched the detected ISBN. If the wrong book appears, "
+                    "correct the ISBN here and ChapLab searches again automatically."
                 )
                 st.caption("Ready for another book? Use **Clear / Scan New Book** above.")
 

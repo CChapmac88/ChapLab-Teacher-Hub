@@ -1,0 +1,164 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<style>
+html,body{margin:0;padding:0;background:transparent;font-family:Arial,sans-serif}
+.wrap{max-width:560px;margin:0 auto}
+.toolbar{display:flex;gap:8px;margin-bottom:8px}
+button{
+  flex:1;padding:10px 12px;border:1px solid #cfd6df;border-radius:9px;
+  background:white;font-weight:700;cursor:pointer
+}
+button.active{background:#ff4b4b;color:white;border-color:#ff4b4b}
+.camera-shell{
+  position:relative;background:#111;border-radius:16px;overflow:hidden;
+  min-height:310px
+}
+#reader{width:100%;min-height:310px}
+#reader video{
+  width:100%!important;
+  height:340px!important;
+  object-fit:cover!important;
+  transform:none!important;
+}
+.guide{
+  position:absolute;left:12%;right:12%;top:38%;height:24%;
+  border:3px solid rgba(255,255,255,.95);border-radius:12px;
+  pointer-events:none;box-shadow:0 0 0 9999px rgba(0,0,0,.10)
+}
+.guide:before{
+  content:"ISBN BARCODE";
+  position:absolute;top:-28px;left:50%;transform:translateX(-50%);
+  background:rgba(0,0,0,.65);color:#fff;border-radius:6px;
+  padding:5px 8px;font-size:12px;font-weight:700
+}
+.status{text-align:center;font-size:12px;color:#5d6775;margin-top:7px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="toolbar">
+    <button id="frontBtn">Front Camera</button>
+    <button id="backBtn" class="active">Back Camera</button>
+  </div>
+  <div class="camera-shell">
+    <div id="reader"></div>
+    <div class="guide"></div>
+  </div>
+  <div id="status" class="status">Starting back camera…</div>
+</div>
+
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script>
+(function(){
+  let scanner=null;
+  let preferred="environment";
+  let running=false;
+  let lastValue="";
+  const statusEl=document.getElementById("status");
+  const frontBtn=document.getElementById("frontBtn");
+  const backBtn=document.getElementById("backBtn");
+
+  function sendValue(v){
+    window.parent.postMessage({
+      isStreamlitMessage:true,
+      type:"streamlit:setComponentValue",
+      value:v
+    },"*");
+  }
+  function setHeight(){
+    window.parent.postMessage({
+      isStreamlitMessage:true,
+      type:"streamlit:setFrameHeight",
+      height:450
+    },"*");
+  }
+  function setActive(){
+    frontBtn.classList.toggle("active",preferred==="user");
+    backBtn.classList.toggle("active",preferred==="environment");
+  }
+  async function stopScanner(){
+    if(scanner && running){
+      try{await scanner.stop();}catch(e){}
+      running=false;
+    }
+    if(scanner){try{scanner.clear();}catch(e){}}
+  }
+  async function startScanner(mode){
+    preferred=mode;
+    setActive();
+    await stopScanner();
+    document.getElementById("reader").innerHTML="";
+    scanner=new Html5Qrcode("reader",{
+      formatsToSupport:[
+        Html5QrcodeSupportedFormats.EAN_13,
+        Html5QrcodeSupportedFormats.EAN_8,
+        Html5QrcodeSupportedFormats.UPC_A,
+        Html5QrcodeSupportedFormats.UPC_E,
+        Html5QrcodeSupportedFormats.CODE_128
+      ],
+      verbose:false
+    });
+
+    statusEl.textContent=(mode==="user"?"Starting front camera…":"Starting back camera…");
+    const config={
+      fps:12,
+      qrbox:function(w,h){
+        return {width:Math.max(240,Math.floor(w*.72)),height:Math.max(100,Math.floor(h*.26))};
+      },
+      aspectRatio:1.333334,
+      disableFlip:true
+    };
+
+    async function begin(constraints){
+      await scanner.start(
+        constraints,
+        config,
+        function(decodedText){
+          const cleaned=String(decodedText||"").trim();
+          if(cleaned && cleaned!==lastValue){
+            lastValue=cleaned;
+            statusEl.textContent="Barcode detected";
+            sendValue(cleaned);
+          }
+        },
+        function(){}
+      );
+      running=true;
+      statusEl.textContent=(mode==="user"?"Front camera ready":"Back camera ready");
+      setHeight();
+    }
+
+    try{
+      await begin({facingMode:{exact:mode}});
+    }catch(e){
+      try{
+        await begin({facingMode:mode});
+      }catch(err){
+        statusEl.textContent="Could not start this camera. Try the other camera.";
+        setHeight();
+      }
+    }
+  }
+
+  frontBtn.addEventListener("click",()=>startScanner("user"));
+  backBtn.addEventListener("click",()=>startScanner("environment"));
+
+  window.parent.postMessage({
+    isStreamlitMessage:true,
+    type:"streamlit:componentReady",
+    apiVersion:1
+  },"*");
+
+  window.addEventListener("message",(event)=>{
+    if((event.data||{}).type==="streamlit:render"){setHeight();}
+  });
+
+  setHeight();
+  startScanner("environment");
+})();
+</script>
+</body>
+</html>
