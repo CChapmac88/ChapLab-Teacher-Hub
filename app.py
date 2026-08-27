@@ -18,10 +18,6 @@ try:
 except Exception:
     PdfReader=None
 
-try:
-    import zxingcpp
-except Exception:
-    zxingcpp=None
 
 try:
     from supabase import create_client
@@ -120,6 +116,10 @@ def require_login():
     st.stop()
 
 require_login()
+
+# Lightweight diagnostic marker: if this appears in Streamlit logs,
+# ChapLab passed imports/login setup and entered normal app execution.
+print("ChapLab startup: core app loaded; barcode engine deferred until scan.", flush=True)
 
 def _cloud_headers(content_type=None):
     cfg=cloud_config()
@@ -2266,8 +2266,14 @@ def decode_isbn_barcode(image_file):
     """Decode an ISBN barcode using multiple crops, scales, rotations and sharpening passes."""
     if image_file is None:
         return None, "No barcode image was provided."
-    if zxingcpp is None:
-        return None, "Barcode reader is not installed yet. Redeploy after updating requirements.txt."
+
+    # IMPORTANT: zxing-cpp is a native extension. Import it only when the
+    # teacher actually scans a barcode so it can never delay ChapLab startup.
+    try:
+        import zxingcpp
+    except Exception as e:
+        return None, f"Barcode reader could not start: {e}"
+
     try:
         from PIL import Image, ImageEnhance, ImageOps, ImageFilter
         import numpy as np
