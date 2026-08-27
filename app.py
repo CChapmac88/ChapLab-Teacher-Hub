@@ -2263,55 +2263,108 @@ def import_ocr_preview(preview_df, assignments_by_col):
 
 
 def decode_isbn_barcode(image_file):
-    """Decode EAN/UPC/ISBN barcode from an uploaded/camera image."""
+    """Decode an ISBN barcode using multiple crops, scales, rotations and sharpening passes."""
     if image_file is None:
         return None, "No barcode image was provided."
     if zxingcpp is None:
         return None, "Barcode reader is not installed yet. Redeploy after updating requirements.txt."
     try:
-        from PIL import Image, ImageEnhance, ImageOps
+        from PIL import Image, ImageEnhance, ImageOps, ImageFilter
         import numpy as np
 
         raw=image_file.getvalue() if hasattr(image_file,"getvalue") else bytes(image_file.getbuffer())
         img=Image.open(BytesIO(raw)).convert("RGB")
+        w,h=img.size
 
-        # Try several useful variants. ISBN book barcodes are normally EAN-13.
-        candidates=[img]
-        gray=ImageOps.grayscale(img)
-        candidates.append(gray)
-        candidates.append(ImageEnhance.Contrast(gray).enhance(2.0))
+        # Camera previews can look soft even on a very good phone camera.
+        # We compensate AFTER capture by trying the full frame plus progressively
+        # tighter center regions, where the user is instructed to place the barcode.
+        regions=[img]
+        crop_specs=[
+            (0.05,0.18,0.95,0.82),  # broad barcode band
+            (0.10,0.25,0.90,0.75),  # medium center
+            (0.18,0.30,0.82,0.70),  # tight center
+        ]
+        for l,t,r,b in crop_specs:
+            crop=img.crop((int(w*l),int(h*t),int(w*r),int(h*b)))
+            if crop.width>100 and crop.height>60:
+                regions.append(crop)
 
-        # Upscale smaller camera captures to improve barcode detection.
-        if img.width < 1600:
-            scale=max(1.5,1600/max(img.width,1))
-            candidates.append(img.resize((int(img.width*scale),int(img.height*scale))))
-            candidates.append(gray.resize((int(gray.width*scale),int(gray.height*scale))))
+        candidates=[]
+        for region in regions:
+            # Preserve original detail.
+            candidates.append(region)
+            gray=ImageOps.grayscale(region)
+            candidates.append(gray)
 
+            # Barcode lines benefit from local sharpness/contrast more than OCR.
+            sharp=gray.filter(ImageFilter.UnsharpMask(radius=2,percent=180,threshold=2))
+            candidates.append(sharp)
+            candidates.append(ImageEnhance.Contrast(sharp).enhance(1.7))
+            candidates.append(ImageEnhance.Contrast(sharp).enhance(2.4))
+
+            # Upscale so narrow barcode bars remain distinguishable to ZXing.
+            target_width=max(1800,region.width)
+            if region.width < target_width:
+                scale=target_width/max(region.width,1)
+                size=(int(region.width*scale),int(region.height*scale))
+                up=region.resize(size,Image.Resampling.LANCZOS)
+                up_gray=ImageOps.grayscale(up)
+                up_sharp=up_gray.filter(ImageFilter.UnsharpMask(radius=2,percent=200,threshold=2))
+                candidates.extend([
+                    up,
+                    up_gray,
+                    up_sharp,
+                    ImageEnhance.Contrast(up_sharp).enhance(1.8),
+                    ImageEnhance.Contrast(up_sharp).enhance(2.5),
+                ])
+
+        # Remove duplicate-size/mode candidates where possible while keeping useful passes.
         decoded=[]
         for candidate in candidates:
-            try:
-                results=zxingcpp.read_barcodes(np.array(candidate))
-            except Exception:
-                results=[]
-            for result in results:
-                value=str(getattr(result,"text","") or "").strip()
-                cleaned=re.sub(r"[^0-9Xx]","",value)
-                if cleaned and cleaned not in decoded:
-                    decoded.append(cleaned)
+            for angle in (0,90,270):
+                scan_img=candidate if angle==0 else candidate.rotate(angle,expand=True)
+                try:
+                    results=zxingcpp.read_barcodes(
+                        np.array(scan_img),
+                        try_rotate=True,
+                        try_downscale=True,
+                        try_invert=True
+                    )
+                except TypeError:
+                    # Compatibility with zxing-cpp builds that expose fewer kwargs.
+                    try:
+                        results=zxingcpp.read_barcodes(np.array(scan_img))
+                    except Exception:
+                        results=[]
+                except Exception:
+                    results=[]
 
-        # Prefer ISBN-13 / Bookland EAN starting 978 or 979, then valid-length codes.
-        for code in decoded:
-            if len(code)==13 and code.startswith(("978","979")):
-                return code, None
+                for result in results:
+                    value=str(getattr(result,"text","") or "").strip()
+                    cleaned=re.sub(r"[^0-9Xx]","",value)
+                    if cleaned and cleaned not in decoded:
+                        decoded.append(cleaned)
+
+                # Stop the expensive enhancement loop as soon as Bookland ISBN is found.
+                for code in decoded:
+                    if len(code)==13 and code.startswith(("978","979")):
+                        return code,None
+
         for code in decoded:
             if len(code) in (10,13):
-                return code, None
+                return code,None
 
         if decoded:
-            return None, "A barcode was detected, but it did not contain a 10- or 13-digit ISBN."
-        return None, "I couldn't read the ISBN barcode. Move closer, keep the barcode flat, and make sure the full barcode is in focus."
+            return None, "I found a barcode, but it was not a 10- or 13-digit ISBN. Center the ISBN barcode (usually beginning 978 or 979) and rescan."
+
+        return None, (
+            "The barcode is too soft to read. Move the phone a little farther back until the black bars look sharp, "
+            "keep the entire barcode inside the center of the picture, avoid glare, and capture again."
+        )
     except Exception as e:
         return None, f"Barcode scan failed: {e}"
+
 
 def lookup_and_store_isbn(isbn):
     """Look up an ISBN and sync the Book Leveler search controls/results."""
@@ -5027,9 +5080,14 @@ elif page=="Book Leveler":
                         st.session_state["show_book_camera"]=False
                         st.rerun()
 
+                    st.info(
+                        "📚 **Scanner Mode:** Put the entire ISBN barcode near the CENTER of the picture. "
+                        "If the bars look blurry, move the phone slightly farther away until they become sharp. "
+                        "Avoid glare and hold still when you capture."
+                    )
                     st.caption(
-                        "Center the entire ISBN barcode in the camera, keep it flat and in focus, then capture the photo. "
-                        "ChapLab will read the number automatically."
+                        "After capture, ChapLab automatically crops the barcode area, enlarges it, sharpens it, "
+                        "increases contrast, checks rotated versions, and tries several scans before asking you to rescan."
                     )
                     camera_photo=st.camera_input(
                         "Capture ISBN barcode",
@@ -5037,6 +5095,9 @@ elif page=="Book Leveler":
                     )
 
                     if camera_photo is not None:
+                        with st.expander("🔍 Check captured barcode",expanded=False):
+                            st.image(camera_photo,caption="Captured image — the complete barcode should look sharp here.",use_container_width=True)
+                            st.caption("If the black barcode lines are smeared together, capture it again from slightly farther away.")
                         scan_token=(camera_photo.name if getattr(camera_photo,"name",None) else "camera",
                                     len(camera_photo.getvalue()))
                         if st.session_state.get("_last_camera_scan_token")!=scan_token:
