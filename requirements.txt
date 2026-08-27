@@ -10,3 +10,4 @@ supabase>=2.0,<3
 pypdf>=5.0
 zxing-cpp>=2.2
 streamlit-back-camera-input>=0.1.1
+opencv-python-headless>=4.10

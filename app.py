@@ -29,13 +29,28 @@ st.set_page_config(page_title="ChapLab Teacher Hub", page_icon="📘", layout="w
 
 st.markdown("""
 <style>
-/* ChapLab Book Scanner — mirrored live camera preview on phone + computer.
-   This affects only the visual preview. Captured image bytes stay unmirrored. */
-[data-testid="stCameraInput"] video,
+/* ChapLab Book Scanner — compact mirrored live preview.
+   Visual preview is mirrored; captured image bytes remain normal. */
+[data-testid="stCameraInput"]{
+    max-width:560px !important;
+    margin:0 auto !important;
+}
+[data-testid="stCameraInput"] video{
+    transform:scaleX(-1) !important;
+    transform-origin:center center !important;
+    max-height:340px !important;
+    width:100% !important;
+    object-fit:cover !important;
+    border-radius:16px !important;
+}
 [data-testid="stCameraInput"] canvas,
-[data-testid="stCameraInput"] img {
-    transform: scaleX(-1) !important;
-    transform-origin: center center !important;
+[data-testid="stCameraInput"] img{
+    transform:scaleX(-1) !important;
+    transform-origin:center center !important;
+    max-height:340px !important;
+    width:100% !important;
+    object-fit:contain !important;
+    border-radius:16px !important;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -2507,12 +2522,10 @@ def import_ocr_preview(preview_df, assignments_by_col):
 
 
 def decode_isbn_barcode(image_file):
-    """Decode an ISBN barcode using multiple crops, scales, rotations and sharpening passes."""
+    """Aggressively decode a book ISBN barcode from phone/computer captures."""
     if image_file is None:
         return None, "No barcode image was provided."
 
-    # IMPORTANT: zxing-cpp is a native extension. Import it only when the
-    # teacher actually scans a barcode so it can never delay ChapLab startup.
     try:
         import zxingcpp
     except Exception as e:
@@ -2523,98 +2536,121 @@ def decode_isbn_barcode(image_file):
         import numpy as np
 
         if hasattr(image_file,"convert") and hasattr(image_file,"size"):
-            # PIL.Image from rear-camera custom component.
             img=image_file.convert("RGB")
         else:
             raw=image_file.getvalue() if hasattr(image_file,"getvalue") else bytes(image_file.getbuffer())
             img=Image.open(BytesIO(raw)).convert("RGB")
+
         w,h=img.size
 
-        # Camera previews can look soft even on a very good phone camera.
-        # We compensate AFTER capture by trying the full frame plus progressively
-        # tighter center regions, where the user is instructed to place the barcode.
-        regions=[img]
-        crop_specs=[
-            (0.05,0.18,0.95,0.82),  # broad barcode band
-            (0.10,0.25,0.90,0.75),  # medium center
-            (0.18,0.30,0.82,0.70),  # tight center
+        # The compact scanner guide is centered, so prioritize center-band crops.
+        # Also keep broad/full frame passes in case the barcode is slightly off-center.
+        regions=[
+            img,
+            img.crop((int(w*.03),int(h*.15),int(w*.97),int(h*.85))),
+            img.crop((int(w*.08),int(h*.25),int(w*.92),int(h*.75))),
+            img.crop((int(w*.14),int(h*.31),int(w*.86),int(h*.69))),
+            img.crop((int(w*.20),int(h*.36),int(w*.80),int(h*.64))),
         ]
-        for l,t,r,b in crop_specs:
-            crop=img.crop((int(w*l),int(h*t),int(w*r),int(h*b)))
-            if crop.width>100 and crop.height>60:
-                regions.append(crop)
 
-        candidates=[]
-        for region in regions:
-            # Preserve original detail.
-            candidates.append(region)
-            gray=ImageOps.grayscale(region)
-            candidates.append(gray)
-
-            # Barcode lines benefit from local sharpness/contrast more than OCR.
-            sharp=gray.filter(ImageFilter.UnsharpMask(radius=2,percent=180,threshold=2))
-            candidates.append(sharp)
-            candidates.append(ImageEnhance.Contrast(sharp).enhance(1.7))
-            candidates.append(ImageEnhance.Contrast(sharp).enhance(2.4))
-
-            # Upscale so narrow barcode bars remain distinguishable to ZXing.
-            target_width=max(1800,region.width)
-            if region.width < target_width:
-                scale=target_width/max(region.width,1)
-                size=(int(region.width*scale),int(region.height*scale))
-                up=region.resize(size,Image.Resampling.LANCZOS)
-                up_gray=ImageOps.grayscale(up)
-                up_sharp=up_gray.filter(ImageFilter.UnsharpMask(radius=2,percent=200,threshold=2))
-                candidates.extend([
-                    up,
-                    up_gray,
-                    up_sharp,
-                    ImageEnhance.Contrast(up_sharp).enhance(1.8),
-                    ImageEnhance.Contrast(up_sharp).enhance(2.5),
-                ])
-
-        # Remove duplicate-size/mode candidates where possible while keeping useful passes.
         decoded=[]
-        for candidate in candidates:
-            for angle in (0,90,270):
-                scan_img=candidate if angle==0 else candidate.rotate(angle,expand=True)
-                try:
-                    results=zxingcpp.read_barcodes(
-                        np.array(scan_img),
-                        try_rotate=True,
-                        try_downscale=True,
-                        try_invert=True
-                    )
-                except TypeError:
-                    # Compatibility with zxing-cpp builds that expose fewer kwargs.
+        def harvest(candidate):
+            arrays=[]
+            try:
+                arr=np.array(candidate)
+                arrays.append(arr)
+            except Exception:
+                return None
+
+            # Optional OpenCV passes give barcode lines more separation.
+            try:
+                import cv2
+                arr=np.array(candidate)
+                if arr.ndim==3:
+                    gray=cv2.cvtColor(arr,cv2.COLOR_RGB2GRAY)
+                else:
+                    gray=arr
+                arrays.append(gray)
+                blur=cv2.GaussianBlur(gray,(3,3),0)
+                arrays.append(blur)
+                arrays.append(cv2.equalizeHist(gray))
+                arrays.append(cv2.adaptiveThreshold(
+                    gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    cv2.THRESH_BINARY,31,7
+                ))
+                _,otsu=cv2.threshold(gray,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+                arrays.append(otsu)
+            except Exception:
+                pass
+
+            for arr in arrays:
+                for rotate in (True,False):
                     try:
-                        results=zxingcpp.read_barcodes(np.array(scan_img))
+                        results=zxingcpp.read_barcodes(
+                            arr,
+                            try_rotate=rotate,
+                            try_downscale=True,
+                            try_invert=True
+                        )
+                    except TypeError:
+                        try:
+                            results=zxingcpp.read_barcodes(arr)
+                        except Exception:
+                            results=[]
                     except Exception:
                         results=[]
-                except Exception:
-                    results=[]
 
-                for result in results:
-                    value=str(getattr(result,"text","") or "").strip()
-                    cleaned=re.sub(r"[^0-9Xx]","",value)
-                    if cleaned and cleaned not in decoded:
-                        decoded.append(cleaned)
+                    for result in results:
+                        value=str(getattr(result,"text","") or "").strip()
+                        cleaned=re.sub(r"[^0-9Xx]","",value)
+                        if cleaned and cleaned not in decoded:
+                            decoded.append(cleaned)
+                        if len(cleaned)==13 and cleaned.startswith(("978","979")):
+                            return cleaned
+            return None
 
-                # Stop the expensive enhancement loop as soon as Bookland ISBN is found.
-                for code in decoded:
-                    if len(code)==13 and code.startswith(("978","979")):
-                        return code,None
+        for region in regions:
+            base=[region]
+            gray=ImageOps.grayscale(region)
+            sharp=gray.filter(ImageFilter.UnsharpMask(radius=2,percent=220,threshold=1))
+            base.extend([
+                gray,
+                sharp,
+                ImageEnhance.Contrast(sharp).enhance(1.6),
+                ImageEnhance.Contrast(sharp).enhance(2.2),
+                ImageEnhance.Contrast(sharp).enhance(3.0),
+            ])
+
+            # Upscale every region aggressively; barcode bars need pixel separation.
+            for target_w in (1800,2400):
+                if region.width < target_w:
+                    scale=target_w/max(region.width,1)
+                    up=region.resize(
+                        (int(region.width*scale),int(region.height*scale)),
+                        Image.Resampling.LANCZOS
+                    )
+                    upg=ImageOps.grayscale(up)
+                    ups=upg.filter(ImageFilter.UnsharpMask(radius=2,percent=240,threshold=1))
+                    base.extend([
+                        up,upg,ups,
+                        ImageEnhance.Contrast(ups).enhance(1.8),
+                        ImageEnhance.Contrast(ups).enhance(2.6),
+                    ])
+
+            for candidate in base:
+                found=harvest(candidate)
+                if found:
+                    return found,None
 
         for code in decoded:
             if len(code) in (10,13):
                 return code,None
 
         if decoded:
-            return None, "I found a barcode, but it was not a 10- or 13-digit ISBN. Center the ISBN barcode (usually beginning 978 or 979) and rescan."
-
+            return None, "A barcode was detected, but it was not a valid ISBN. Keep the 978/979 ISBN barcode inside the guide box."
         return None, (
-            "The barcode is too soft to read. Move the phone a little farther back until the black bars look sharp, "
-            "keep the entire barcode inside the center of the picture, avoid glare, and capture again."
+            "ChapLab couldn't read the barcode automatically. Keep the whole ISBN barcode inside the guide box, "
+            "move the phone slightly farther away until the black lines separate clearly, avoid glare, and capture again."
         )
     except Exception as e:
         return None, f"Barcode scan failed: {e}"
@@ -5386,12 +5422,13 @@ elif page=="Book Leveler":
                 "_book_scan_error",
                 "_last_camera_scan_token",
                 "book_isbn_camera_capture_fallback",
+                "show_hi_res_fallback",
+                "open_hi_res_fallback",
             ):
                 st.session_state.pop(k,None)
             st.session_state["book_online_search_mode"]="ISBN"
 
         if identify_mode=="Camera":
-            st.markdown('<div class="chaplab-mirrored-camera"></div>', unsafe_allow_html=True)
             scan_title_col,scan_clear_col=st.columns([3,1])
             with scan_title_col:
                 st.markdown("#### 📷 Rear Camera Scanner")
@@ -5399,17 +5436,29 @@ elif page=="Book Leveler":
                 if st.button("🧹 Clear / Scan New Book",key="clear_camera_book",use_container_width=True):
                     clear_book_scanner()
                     st.rerun()
+
             st.info(
-                "ChapLab uses the **rear/environment camera on phones** and mirrors the live preview on both "
-                "**phones and computers** so positioning feels natural. The captured barcode image itself stays "
-                "normal for accurate ISBN decoding."
+                "Use the **rear camera** on phones. Keep the whole ISBN barcode inside the guide area. "
+                "The preview is mirrored for positioning, but the captured image stays normal for decoding."
             )
             st.caption(
-                "Hold the phone about 8–14 inches from the book. Keep the entire ISBN barcode in the center. "
-                "The rear camera usually focuses better when you are not extremely close."
+                "Best distance: about 8–14 inches away. If the barcode lines look smeared together, move a little farther back."
             )
 
-            # Lazy import so a community camera component can never block ChapLab startup.
+            # Compact visual guide above the camera. The actual decoder prioritizes the same center area.
+            st.markdown(
+                """
+                <div style="
+                    max-width:560px;margin:0 auto 8px auto;
+                    border:2px dashed #ff4b4b;border-radius:14px;
+                    padding:10px 14px;text-align:center;
+                    background:rgba(255,75,75,.05);font-weight:700;">
+                    ▬ Keep the full ISBN barcode centered here ▬
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
             rear_component=None
             rear_component_error=None
             try:
@@ -5421,52 +5470,58 @@ elif page=="Book Leveler":
             rear_photo=None
             if rear_component is not None:
                 try:
-                    st.caption("Tap the rear-camera preview to capture the barcode.")
                     rear_photo=rear_component()
                 except Exception as e:
                     rear_component_error=str(e)
                     rear_photo=None
 
+            # If custom rear-only component returns nothing or fails, offer explicit fallback button
+            # instead of immediately creating a huge second camera.
             if rear_photo is None and rear_component_error:
                 st.warning(
-                    "Rear-camera-only component could not start in this browser. "
-                    "Using ChapLab's high-resolution camera fallback instead."
+                    "Rear-camera component could not start in this browser. "
+                    "Use the high-resolution fallback below."
                 )
-                # Streamlit 1.62 supports requested capture resolution.
-                # This fallback may still expose the browser's camera switch control.
+                if st.button("Open High-Resolution Camera Fallback",key="open_hi_res_fallback"):
+                    st.session_state["show_hi_res_fallback"]=True
+                    st.rerun()
+
+            if st.session_state.get("show_hi_res_fallback",False):
                 rear_photo=st.camera_input(
                     "Capture ISBN barcode",
                     key="book_isbn_camera_capture_fallback",
                     resolution="1080p",
-                    width="stretch"
+                    width=560
                 )
 
             if rear_photo is not None:
-                with st.expander("🔍 Check captured barcode",expanded=False):
+                # Show only a compact preview of the captured frame.
+                with st.expander("🔍 Check Captured Barcode",expanded=False):
                     st.image(
                         rear_photo,
-                        caption="Captured image — the complete barcode should look sharp here.",
-                        use_container_width=True
-                    )
-                    st.caption(
-                        "If the black barcode lines blend together, move the phone slightly farther away and capture again."
+                        caption="Captured frame — the barcode lines should be distinct, not blended together.",
+                        width=560
                     )
 
-                # Create a stable-enough token without assuming UploadedFile.
+                # Build a more reliable token from image bytes or PIL dimensions.
                 try:
                     if hasattr(rear_photo,"getvalue"):
-                        token_size=len(rear_photo.getvalue())
-                    elif hasattr(rear_photo,"size") and isinstance(rear_photo.size,tuple):
-                        token_size=rear_photo.size
+                        import hashlib
+                        raw=rear_photo.getvalue()
+                        scan_token=hashlib.sha1(raw).hexdigest()
+                    elif hasattr(rear_photo,"tobytes"):
+                        import hashlib
+                        scan_token=hashlib.sha1(rear_photo.tobytes()).hexdigest()
                     else:
-                        token_size=str(type(rear_photo))
+                        scan_token=str(rear_photo)
                 except Exception:
-                    token_size=str(type(rear_photo))
-                scan_token=("rear-camera",str(token_size))
+                    scan_token=str(type(rear_photo))
 
                 if st.session_state.get("_last_camera_scan_token")!=scan_token:
                     st.session_state["_last_camera_scan_token"]=scan_token
-                    with st.spinner("Reading ISBN barcode..."):
+
+                    # Auto-detection: try immediately after capture.
+                    with st.spinner("Auto-detecting ISBN..."):
                         detected,error=decode_isbn_barcode(rear_photo)
 
                     if detected:
@@ -5480,24 +5535,26 @@ elif page=="Book Leveler":
                             st.session_state["_book_scan_message"]=(
                                 f"✅ ISBN **{detected}** detected and book information loaded."
                                 if found else
-                                f"✅ ISBN **{detected}** detected. No Open Library match was found, but the ISBN has been populated."
+                                f"✅ ISBN **{detected}** detected. The ISBN has been filled in, but Open Library did not return a match."
                             )
                         except Exception as e:
                             st.session_state["book_online_results"]=[]
                             st.session_state["_book_scan_message"]=f"✅ ISBN **{detected}** detected. Lookup error: {e}"
+                        st.session_state["show_hi_res_fallback"]=False
                         st.rerun()
                     else:
                         st.session_state["_book_scan_error"]=error
-                        st.rerun()
 
             if st.session_state.get("_book_scan_error"):
                 st.warning(st.session_state.pop("_book_scan_error"))
+                st.caption("You can capture again immediately; ChapLab will retry auto-detection on the new frame.")
+
             if st.session_state.get("_book_scan_message"):
                 st.success(st.session_state["_book_scan_message"])
 
-            # Manual correction remains available and auto-fills after a successful scan.
             detected_value=st.session_state.get("book_camera_isbn","")
             if detected_value and st.session_state.get("book_camera_manual_correction")!=detected_value:
+                # Safe here before widget creation.
                 st.session_state["book_camera_manual_correction"]=detected_value
 
             manual_cam=st.text_input(
@@ -5506,16 +5563,14 @@ elif page=="Book Leveler":
                 key="book_camera_manual_correction"
             )
             if st.session_state.get("book_camera_isbn"):
-                st.caption("Ready for another book? Use **Clear / Scan New Book** above to reset the ISBN, result, and camera capture.")
+                st.caption("Ready for another book? Use **Clear / Scan New Book** above.")
+
             if st.button("Use This ISBN",key="use_camera_manual_isbn"):
                 cleaned=re.sub(r"[^0-9Xx]","",manual_cam or "")
                 if len(cleaned) not in (10,13):
                     st.warning("Enter a valid 10- or 13-digit ISBN.")
                 else:
                     st.session_state["book_camera_isbn"]=cleaned
-                    # Do not write book_camera_manual_correction here:
-                    # that keyed text_input already exists in this run.
-                    # The box already contains manual_cam; synchronization occurs safely on rerun.
                     st.session_state["book_online_search_mode"]="ISBN"
                     st.session_state["book_online_query"]=cleaned
                     try:
