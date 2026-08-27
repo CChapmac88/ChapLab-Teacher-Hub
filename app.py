@@ -2715,6 +2715,222 @@ def openlibrary_lookup_isbn(isbn):
         raise RuntimeError(f"Open Library ISBN lookup failed: {e}")
 
 
+
+def lexile_hub_lookup_isbn(isbn):
+    """Best-effort lookup against MetaMetrics/Lexile Find a Book pages."""
+    isbn=re.sub(r"[^0-9Xx]","",str(isbn or ""))
+    if len(isbn) not in (10,13):
+        return {"found":False,"lexile":"","url":"","status":"Invalid ISBN"}
+
+    urls=[
+        f"https://hub.lexile.com/find-a-book/details/{isbn}/",
+        f"https://fab-titles.lexile.com/",
+    ]
+    headers={
+        "User-Agent":"Mozilla/5.0 (compatible; ChapLabTeacherHub/4.0)",
+        "Accept-Language":"en-US,en;q=0.9"
+    }
+
+    # Direct detail page first.
+    try:
+        r=requests.get(urls[0],headers=headers,timeout=10,allow_redirects=True)
+        if r.status_code==200 and r.text:
+            plain=_scholastic_plain_text(r.text) if "_scholastic_plain_text" in globals() else re.sub(r"<[^>]+>"," ",r.text)
+            # Prefer measures near explicit Lexile language.
+            pats=[
+                r"Lexile(?:®)?(?: Measure| Level)?\s*:?\s*((?:BR)?[0-9]{1,4}L)\b",
+                r"\b((?:BR)?[0-9]{1,4}L)\b",
+            ]
+            for pat in pats:
+                m=re.search(pat,plain,re.I)
+                if m:
+                    return {
+                        "found":True,
+                        "lexile":m.group(1).upper(),
+                        "url":r.url,
+                        "status":"Lexile Hub measure found"
+                    }
+            # ISBN detail page exists but measure may be rendered client-side.
+            if isbn in re.sub(r"[^0-9Xx]","",plain):
+                return {
+                    "found":True,
+                    "lexile":"",
+                    "url":r.url,
+                    "status":"Lexile Hub matched ISBN; measure not exposed in page HTML"
+                }
+    except Exception:
+        pass
+
+    # Legacy Find-a-Book landing page can sometimes expose search metadata.
+    try:
+        r=requests.get(
+            urls[1],
+            params={"q":isbn},
+            headers=headers,
+            timeout=10,
+            allow_redirects=True
+        )
+        if r.status_code==200 and r.text:
+            plain=re.sub(r"<[^>]+>"," ",r.text)
+            plain=html.unescape(plain) if "html" in globals() else plain
+            m=re.search(r"Lexile(?:®)?(?: Measure| Level)?\s*:?\s*((?:BR)?[0-9]{1,4}L)\b",plain,re.I)
+            if m:
+                return {
+                    "found":True,
+                    "lexile":m.group(1).upper(),
+                    "url":r.url,
+                    "status":"Lexile Find a Book measure found"
+                }
+    except Exception:
+        pass
+
+    return {
+        "found":False,
+        "lexile":"",
+        "url":f"https://hub.lexile.com/find-a-book/details/{isbn}/",
+        "status":"No Lexile measure found automatically"
+    }
+
+def normalize_lexile_measure(value):
+    """Return numeric Lexile when possible; BR values are preserved separately."""
+    raw=str(value or "").strip().upper().replace(" ","")
+    if not raw:
+        return None,raw
+    if raw.startswith("BR"):
+        # Beginning Reader measures aren't safely converted using a simple numeric crosswalk.
+        return None,raw
+    m=re.search(r"([0-9]{1,4})L?",raw)
+    if not m:
+        return None,raw
+    return int(m.group(1)),f"{int(m.group(1))}L"
+
+def estimate_fp_from_lexile(value):
+    """
+    Approximate F&P-style band from Lexile using a general published correlation crosswalk.
+    This is intentionally labeled an estimate; Fountas & Pinnell does not publish
+    an official Lexile conversion chart.
+    """
+    n,display=normalize_lexile_measure(value)
+    if not display:
+        return {"estimate":"","lexile":"","note":""}
+    if n is None:
+        return {
+            "estimate":"A–B (very approximate)",
+            "lexile":display,
+            "note":"Beginning Reader (BR) Lexiles do not map cleanly to a single F&P level."
+        }
+
+    # Approximate bands adapted from commonly used text-level correlation charts.
+    bands=[
+        (0,50,"A–B"),
+        (51,150,"C–E"),
+        (151,200,"F–G"),
+        (201,249,"H"),
+        (250,299,"I"),
+        (300,349,"J"),
+        (350,399,"K"),
+        (400,449,"L"),
+        (450,499,"M"),
+        (500,549,"N"),
+        (550,599,"O"),
+        (600,699,"P"),
+        (700,749,"Q"),
+        (750,799,"R"),
+        (800,849,"S–T"),
+        (850,899,"U–W"),
+        (900,949,"X"),
+        (950,999,"Y"),
+        (1000,9999,"Z+"),
+    ]
+    estimate=""
+    for lo,hi,label in bands:
+        if lo<=n<=hi:
+            estimate=label
+            break
+    return {
+        "estimate":estimate,
+        "lexile":display,
+        "note":"Approximate crosswalk only — use the book's directly published Guided Reading/F&P level when available."
+    }
+
+def _fp_rank(level):
+    """Approximate ordered rank for F&P letters A-Z; ranges use midpoint."""
+    raw=str(level or "").strip().upper()
+    letters=re.findall(r"[A-Z]",raw)
+    if not letters:
+        return None
+    vals=[ord(x)-ord("A")+1 for x in letters]
+    return sum(vals)/len(vals)
+
+def _lexile_number(value):
+    raw=str(value or "").strip().upper()
+    if not raw or raw.startswith("BR"):
+        return None
+    m=re.search(r"([0-9]{1,4})",raw)
+    return int(m.group(1)) if m else None
+
+def evaluate_book_fit(book_fp="",book_lexile="",scholar_fp="",scholar_lexile=""):
+    """
+    Teacher-facing fit indicator. Prefer like-for-like direct level comparisons.
+    This is guidance, not a replacement for teacher judgment or comprehension data.
+    """
+    bfp=_fp_rank(book_fp)
+    sfp=_fp_rank(scholar_fp)
+    blx=_lexile_number(book_lexile)
+    slx=_lexile_number(scholar_lexile)
+
+    # Prefer direct F&P/Guided Reading comparison when both exist.
+    if bfp is not None and sfp is not None:
+        gap=bfp-sfp
+        if gap <= -3:
+            return ("Likely Too Easy","Independent practice/review",
+                    "This book is several F&P levels below the scholar's saved level.")
+        if gap <= 1:
+            return ("Good Fit","Independent Reading",
+                    "This book is at or very close to the scholar's saved F&P level.")
+        if gap <= 3:
+            return ("Slightly Challenging","Instructional / With Support",
+                    "This book is somewhat above the scholar's saved F&P level.")
+        return ("Too Difficult Right Now","Read-aloud / Teacher Support",
+                "This book is well above the scholar's saved F&P level for independent reading.")
+
+    # Lexile comparison if both measures exist. Use broad, teacher-friendly bands.
+    if blx is not None and slx is not None:
+        gap=blx-slx
+        if gap < -150:
+            return ("Likely Too Easy","Independent practice/review",
+                    "The book's Lexile is substantially below the scholar's saved Lexile.")
+        if gap <= 75:
+            return ("Good Fit","Independent Reading",
+                    "The book's Lexile is close to the scholar's saved Lexile.")
+        if gap <= 200:
+            return ("Slightly Challenging","Instructional / With Support",
+                    "The book's Lexile is above the scholar's saved Lexile but may work with support.")
+        return ("Too Difficult Right Now","Read-aloud / Teacher Support",
+                "The book's Lexile is substantially above the scholar's saved Lexile for independent reading.")
+
+    return ("Need More Data","Teacher Review",
+            "ChapLab needs a comparable saved scholar level and book level to make a fit recommendation.")
+
+def _scholar_level_from_record(record):
+    """Best-effort extraction from existing ChapLab scholar records without changing their schema."""
+    if not isinstance(record,dict):
+        return "",""
+    fp_keys=["fp_level","f_and_p","f&p","fountas_pinnell","reading_level","guided_reading","gr_level"]
+    lex_keys=["lexile","lexile_level","lexile_measure"]
+    fp=""
+    lx=""
+    for k in fp_keys:
+        if record.get(k) not in (None,""):
+            fp=str(record.get(k)).strip().upper()
+            break
+    for k in lex_keys:
+        if record.get(k) not in (None,""):
+            lx=str(record.get(k)).strip().upper()
+            break
+    return fp,lx
+
+
 def google_books_lookup_isbn(isbn):
     """Look up an exact ISBN through the public Google Books volumes API."""
     isbn=re.sub(r"[^0-9Xx]","",str(isbn or ""))
@@ -2900,13 +3116,26 @@ def internet_book_lookup_isbn(isbn):
         isbn,
         title=str(base.get("title") or "")
     )
+    lexile_hub=lexile_hub_lookup_isbn(isbn)
+
+    # Prefer an explicit Lexile from Lexile Hub. Fall back to Scholastic.
+    scholastic_levels=scholastic.get("levels") or {}
+    lexile_measure=(lexile_hub.get("lexile") or scholastic_levels.get("lexile") or "").strip().upper()
+    fp_estimate=estimate_fp_from_lexile(lexile_measure) if lexile_measure else {
+        "estimate":"","lexile":"","note":""
+    }
+
     base["google_books"]=google or {}
     base["open_library"]=openlib or {}
     base["scholastic"]=scholastic
+    base["lexile_hub"]=lexile_hub
+    base["lexile_measure"]=lexile_measure
+    base["estimated_fp_from_lexile"]=fp_estimate
     base["lookup_sources"]={
+        "Lexile Find a Book":bool(lexile_hub.get("found")),
+        "Scholastic":bool(scholastic.get("found")),
         "Google Books":bool(google),
         "Open Library":bool(openlib),
-        "Scholastic":bool(scholastic.get("found")),
     }
     return base
 
@@ -5599,8 +5828,12 @@ elif page=="Book Leveler":
                     level_bits.append(f"F&P {levels['fountas_pinnell']}")
                 if levels.get("guided_reading"):
                     level_bits.append(f"Guided Reading {levels['guided_reading']}")
-                if levels.get("lexile"):
-                    level_bits.append(f"Lexile {levels['lexile']}")
+                lexile_value=(researched.get("lexile_measure") or levels.get("lexile") or "").strip()
+                if lexile_value:
+                    level_bits.append(f"Lexile {lexile_value}")
+                fp_guess=(researched.get("estimated_fp_from_lexile") or {}).get("estimate")
+                if fp_guess:
+                    level_bits.append(f"Estimated F&P {fp_guess}")
                 suffix=(" • "+", ".join(level_bits)) if level_bits else ""
                 st.session_state["_book_scan_message"]=(
                     f"✅ ISBN **{_pending_lookup}** researched automatically. "
@@ -5835,8 +6068,27 @@ elif page=="Book Leveler":
 
             scholastic=book.get("scholastic") or {}
             sch_levels=scholastic.get("levels") or {}
-            if sch_levels:
+            lexile_info=book.get("lexile_hub") or {}
+            lexile_measure=(book.get("lexile_measure") or sch_levels.get("lexile") or "").strip().upper()
+            fp_est=(book.get("estimated_fp_from_lexile") or {})
+            if lexile_measure or sch_levels:
                 st.markdown("#### 📚 Reading Levels Found Online")
+
+            if lexile_measure:
+                st.success(f"**Lexile Measure:** {lexile_measure}")
+                if lexile_info.get("found"):
+                    st.caption("Lexile source: MetaMetrics Lexile Find a Book")
+                elif sch_levels.get("lexile"):
+                    st.caption("Lexile source: Scholastic")
+
+                fp_guess=(fp_est.get("estimate") or "").strip()
+                if fp_guess:
+                    st.info(
+                        f"**Estimated F&P from Lexile:** {fp_guess}\n\n"
+                        "This is an approximate crosswalk, not an official Fountas & Pinnell conversion."
+                    )
+
+            if sch_levels:
                 if sch_levels.get("fountas_pinnell"):
                     st.success(f"**Scholastic Fountas & Pinnell:** {sch_levels['fountas_pinnell']}")
                 if sch_levels.get("guided_reading"):
@@ -5847,10 +6099,10 @@ elif page=="Book Leveler":
                     st.write(f"**Scholastic DRA:** {sch_levels['dra']}")
                 if sch_levels.get("grade_level"):
                     st.write(f"**Scholastic Grade Level:** {sch_levels['grade_level']}")
-            else:
+            elif not lexile_measure:
                 st.info(
-                    "Google Books/Open Library may identify the edition even when Scholastic does not publish "
-                    "a reading level for that ISBN. ChapLab will not invent a level."
+                    "No Lexile or Scholastic reading level was found automatically for this edition. "
+                    "ChapLab will not invent a level."
                 )
 
             google_info=book.get("google_books") or {}
@@ -5866,6 +6118,109 @@ elif page=="Book Leveler":
             _sch_fp=(sch_levels.get("fountas_pinnell") or "").strip().upper() if 'sch_levels' in locals() else ""
             if _sch_fp and not st.session_state.get("book_verified_fp_online"):
                 st.session_state["book_verified_fp_online"]=_sch_fp
+
+            st.markdown("---")
+            st.markdown("### 👩🏽‍🎓 Is This Book a Good Fit for a Scholar?")
+
+            # Pull from the same scholar roster already used throughout ChapLab.
+            _fit_scholars=[]
+            for _key in ("students","scholars","student_roster","roster"):
+                _candidate=st.session_state.get(_key)
+                if isinstance(_candidate,list) and _candidate:
+                    _fit_scholars=_candidate
+                    break
+
+            _fit_names=[]
+            _fit_records={}
+            for _s in _fit_scholars:
+                if isinstance(_s,dict):
+                    _nm=str(_s.get("name") or _s.get("student_name") or _s.get("scholar_name") or "").strip()
+                    if _nm:
+                        _fit_names.append(_nm)
+                        _fit_records[_nm]=_s
+                elif str(_s).strip():
+                    _fit_names.append(str(_s).strip())
+                    _fit_records[str(_s).strip()]={}
+
+            if _fit_names:
+                _selected_fit=st.selectbox(
+                    "Select scholar",
+                    ["— Select scholar —"]+sorted(set(_fit_names)),
+                    key="book_fit_scholar"
+                )
+            else:
+                _selected_fit="— Select scholar —"
+                st.info(
+                    "Add scholars to your roster and they will appear here automatically. "
+                    "You can still enter a scholar's current level below for a quick comparison."
+                )
+
+            _saved_fp,_saved_lx=("","")
+            if _selected_fit!="— Select scholar —":
+                _saved_fp,_saved_lx=_scholar_level_from_record(_fit_records.get(_selected_fit,{}))
+
+            _fc1,_fc2=st.columns(2)
+            with _fc1:
+                _scholar_fp=st.text_input(
+                    "Scholar current F&P / Guided Reading",
+                    value=_saved_fp,
+                    placeholder="Example: L",
+                    key=f"book_fit_fp_{_selected_fit}"
+                ).strip().upper()
+            with _fc2:
+                _scholar_lx=st.text_input(
+                    "Scholar current Lexile",
+                    value=_saved_lx,
+                    placeholder="Example: 520L",
+                    key=f"book_fit_lexile_{_selected_fit}"
+                ).strip().upper()
+
+            # Direct published book level wins. Estimated F&P is used only if no direct level exists.
+            _direct_book_fp=(
+                (sch_levels.get("fountas_pinnell") or "")
+                or (sch_levels.get("guided_reading") or "")
+            ).strip().upper()
+            _estimated_book_fp=(fp_est.get("estimate") or "").strip().upper()
+            _comparison_book_fp=_direct_book_fp or _estimated_book_fp
+
+            if _selected_fit!="— Select scholar —" or _scholar_fp or _scholar_lx:
+                _fit,_use,_why=evaluate_book_fit(
+                    book_fp=_comparison_book_fp,
+                    book_lexile=lexile_measure,
+                    scholar_fp=_scholar_fp,
+                    scholar_lexile=_scholar_lx
+                )
+
+                if _fit=="Good Fit":
+                    st.success(f"### ✅ {_fit}\\n**Recommended use:** {_use}")
+                elif _fit=="Slightly Challenging":
+                    st.warning(f"### 🟡 {_fit}\\n**Recommended use:** {_use}")
+                elif _fit=="Too Difficult Right Now":
+                    st.error(f"### 🔴 {_fit}\\n**Recommended use:** {_use}")
+                elif _fit=="Likely Too Easy":
+                    st.info(f"### 🔵 {_fit}\\n**Recommended use:** {_use}")
+                else:
+                    st.info(f"### ⚪ {_fit}\\n**Recommended use:** {_use}")
+
+                st.write(_why)
+                _book_level_display=_direct_book_fp or (
+                    f"{_estimated_book_fp} (estimated from Lexile)" if _estimated_book_fp else "Not found"
+                )
+                st.caption(
+                    f"Book level used: {_book_level_display}"
+                    + (f" • Book Lexile: {lexile_measure}" if lexile_measure else "")
+                    + (f" • Scholar F&P: {_scholar_fp}" if _scholar_fp else "")
+                    + (f" • Scholar Lexile: {_scholar_lx}" if _scholar_lx else "")
+                )
+                st.caption(
+                    "Fit is a screening aid. Interest, background knowledge, decoding, fluency, and comprehension "
+                    "can make the same book appropriate for one purpose and not another."
+                )
+
+            st.caption(
+                "Use **Verified F&P** only when you have a direct source. "
+                "The Lexile conversion above is shown separately as an estimate."
+            )
 
             verified_fp=st.text_input(
                 "Verified F&P level (optional)",
