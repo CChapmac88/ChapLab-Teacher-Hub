@@ -5400,20 +5400,29 @@ elif page=="Book Leveler":
         )
 
         def clear_book_scanner():
-            """Clear current book/scan state so the next book starts cleanly."""
+            """Clear every current-book field/result so the next scan starts completely clean."""
             for k in (
                 "book_camera_isbn",
                 "book_camera_manual_correction",
                 "book_online_query",
                 "book_online_results",
+                "book_selected_result",
+                "book_selected_result_idx",
                 "_book_scan_message",
                 "_book_scan_error",
                 "_last_camera_scan_token",
+                "book_isbn_camera_capture",
                 "book_isbn_camera_capture_fallback",
                 "show_hi_res_fallback",
                 "open_hi_res_fallback",
+                "_last_autolookup_isbn",
             ):
                 st.session_state.pop(k,None)
+            # Explicitly blank the visible ISBN/search widgets on the next run.
+            st.session_state["book_online_query"]=""
+            st.session_state["book_camera_manual_correction"]=""
+            st.session_state["book_camera_isbn"]=""
+            st.session_state["book_online_results"]=[]
             st.session_state["book_online_search_mode"]="ISBN"
 
         if identify_mode=="Camera":
@@ -5461,21 +5470,37 @@ elif page=="Book Leveler":
                         detected,error=decode_isbn_barcode(camera_photo)
 
                     if detected:
+                        # One-step camera flow:
+                        # scan -> fill ISBN -> lookup book -> show result.
                         st.session_state["book_camera_isbn"]=detected
                         st.session_state["book_camera_manual_correction"]=detected
                         st.session_state["book_online_search_mode"]="ISBN"
                         st.session_state["book_online_query"]=detected
+                        st.session_state["_last_autolookup_isbn"]=detected
+
                         try:
                             found=openlibrary_lookup_isbn(detected)
                             st.session_state["book_online_results"]=[found] if found else []
-                            st.session_state["_book_scan_message"]=(
-                                f"✅ ISBN **{detected}** detected and book information loaded."
-                                if found else
-                                f"✅ ISBN **{detected}** detected. The ISBN has been filled in, but Open Library did not return a match."
-                            )
+                            if found:
+                                st.session_state["book_selected_result_idx"]=0
+                                st.session_state["book_selected_result"]=found
+                                st.session_state["_book_scan_message"]=(
+                                    f"✅ ISBN **{detected}** detected. **{found.get('title','Book')}** loaded automatically."
+                                )
+                            else:
+                                st.session_state["book_selected_result_idx"]=None
+                                st.session_state["book_selected_result"]=None
+                                st.session_state["_book_scan_message"]=(
+                                    f"✅ ISBN **{detected}** detected, but no matching book was found. "
+                                    "Correct the ISBN below if the scan looks wrong."
+                                )
                         except Exception as e:
                             st.session_state["book_online_results"]=[]
-                            st.session_state["_book_scan_message"]=f"✅ ISBN **{detected}** detected. Lookup error: {e}"
+                            st.session_state["book_selected_result_idx"]=None
+                            st.session_state["book_selected_result"]=None
+                            st.session_state["_book_scan_message"]=(
+                                f"✅ ISBN **{detected}** detected. Lookup could not complete: {e}"
+                            )
                         st.rerun()
                     else:
                         st.session_state["_book_scan_error"]=error
@@ -5491,28 +5516,54 @@ elif page=="Book Leveler":
             if detected_value and st.session_state.get("book_camera_manual_correction")!=detected_value:
                 st.session_state["book_camera_manual_correction"]=detected_value
 
+            def _camera_manual_isbn_changed():
+                raw=st.session_state.get("book_camera_manual_correction","")
+                cleaned=re.sub(r"[^0-9Xx]","",raw or "")
+                # Do nothing until the correction is a complete ISBN.
+                if len(cleaned) not in (10,13):
+                    return
+                if cleaned==st.session_state.get("_last_autolookup_isbn"):
+                    return
+
+                st.session_state["book_camera_isbn"]=cleaned
+                st.session_state["book_online_search_mode"]="ISBN"
+                st.session_state["book_online_query"]=cleaned
+                st.session_state["_last_autolookup_isbn"]=cleaned
+
+                try:
+                    found=openlibrary_lookup_isbn(cleaned)
+                    st.session_state["book_online_results"]=[found] if found else []
+                    if found:
+                        st.session_state["book_selected_result_idx"]=0
+                        st.session_state["book_selected_result"]=found
+                        st.session_state["_book_scan_message"]=(
+                            f"✅ Corrected ISBN **{cleaned}**. **{found.get('title','Book')}** loaded automatically."
+                        )
+                    else:
+                        st.session_state["book_selected_result_idx"]=None
+                        st.session_state["book_selected_result"]=None
+                        st.session_state["_book_scan_message"]=(
+                            f"ISBN **{cleaned}** is valid, but no matching Open Library book was found."
+                        )
+                except Exception as e:
+                    st.session_state["book_online_results"]=[]
+                    st.session_state["book_selected_result_idx"]=None
+                    st.session_state["book_selected_result"]=None
+                    st.session_state["_book_scan_message"]=f"Book lookup failed: {e}"
+
             manual_cam=st.text_input(
                 "Detected ISBN / manual correction",
                 placeholder="978...",
-                key="book_camera_manual_correction"
+                key="book_camera_manual_correction",
+                on_change=_camera_manual_isbn_changed
             )
-            if st.session_state.get("book_camera_isbn"):
-                st.caption("Ready for another book? Use **Clear / Scan New Book** above.")
 
-            if st.button("Use This ISBN",key="use_camera_manual_isbn"):
-                cleaned=re.sub(r"[^0-9Xx]","",manual_cam or "")
-                if len(cleaned) not in (10,13):
-                    st.warning("Enter a valid 10- or 13-digit ISBN.")
-                else:
-                    st.session_state["book_camera_isbn"]=cleaned
-                    st.session_state["book_online_search_mode"]="ISBN"
-                    st.session_state["book_online_query"]=cleaned
-                    try:
-                        found=openlibrary_lookup_isbn(cleaned)
-                        st.session_state["book_online_results"]=[found] if found else []
-                    except Exception as e:
-                        st.error(str(e))
-                    st.rerun()
+            if st.session_state.get("book_camera_isbn"):
+                st.caption(
+                    "The scanned ISBN is looked up automatically. If the wrong book appears, "
+                    "correct the ISBN here and ChapLab will automatically search again."
+                )
+                st.caption("Ready for another book? Use **Clear / Scan New Book** above.")
 
         elif identify_mode=="Upload Barcode Photo":
             barcode_upload=st.file_uploader(
