@@ -11,6 +11,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 import html
+from urllib.parse import urljoin
 import textwrap
 import requests
 
@@ -2742,6 +2743,213 @@ def openlibrary_lookup_isbn(isbn):
     except Exception as e:
         raise RuntimeError(f"Open Library ISBN lookup failed: {e}")
 
+
+def google_books_lookup_isbn(isbn):
+    """Look up an exact ISBN through the public Google Books volumes API."""
+    isbn=re.sub(r"[^0-9Xx]","",str(isbn or ""))
+    if len(isbn) not in (10,13):
+        return None
+    try:
+        r=requests.get(
+            "https://www.googleapis.com/books/v1/volumes",
+            params={"q":f"isbn:{isbn}","maxResults":5,"printType":"books"},
+            timeout=10,
+            headers={"User-Agent":"ChapLabTeacherHub/4.0"}
+        )
+        r.raise_for_status()
+        items=r.json().get("items") or []
+        if not items:
+            return None
+
+        chosen=None
+        for item in items:
+            vi=item.get("volumeInfo") or {}
+            ids=vi.get("industryIdentifiers") or []
+            values={re.sub(r"[^0-9Xx]","",str(x.get("identifier",""))) for x in ids}
+            if isbn in values:
+                chosen=item
+                break
+        chosen=chosen or items[0]
+        vi=chosen.get("volumeInfo") or {}
+        images=vi.get("imageLinks") or {}
+        return {
+            "google_id":chosen.get("id") or "",
+            "title":vi.get("title") or "",
+            "subtitle":vi.get("subtitle") or "",
+            "author":", ".join(vi.get("authors") or []),
+            "publisher":vi.get("publisher") or "",
+            "publish_date":vi.get("publishedDate") or "",
+            "description":vi.get("description") or "",
+            "page_count":vi.get("pageCount") or "",
+            "categories":vi.get("categories") or [],
+            "cover_url":images.get("thumbnail") or images.get("smallThumbnail") or "",
+            "info_link":vi.get("infoLink") or "",
+            "isbn":isbn,
+        }
+    except Exception:
+        return None
+
+def _scholastic_plain_text(raw_html):
+    raw_html=re.sub(r"(?is)<script.*?</script>"," ",raw_html or "")
+    raw_html=re.sub(r"(?is)<style.*?</style>"," ",raw_html)
+    raw_html=re.sub(r"(?s)<[^>]+>"," ",raw_html)
+    raw_html=html.unescape(raw_html)
+    return re.sub(r"\s+"," ",raw_html).strip()
+
+def _parse_scholastic_levels(raw_html):
+    """Extract only leveling information explicitly present in Scholastic HTML."""
+    plain=_scholastic_plain_text(raw_html)
+    levels={}
+    patterns=[
+        ("guided_reading",[
+            r"Guided Reading Level\s*:?\s*([A-Z])\b",
+            r"Guided Reading\s*:?\s*([A-Z])\b",
+            r"GRL\s*:?\s*([A-Z])\b",
+        ]),
+        ("fountas_pinnell",[
+            r"Fountas\s*(?:&|and)\s*Pinnell(?: Level)?\s*:?\s*([A-Z])\b",
+            r"F&P(?: Level)?\s*:?\s*([A-Z])\b",
+        ]),
+        ("lexile",[
+            r"Reading Level\s*:?\s*LEX\s*:?\s*([0-9]{2,4}L)\b",
+            r"Lexile(?:®| Measure| Level)?\s*:?\s*([0-9]{2,4}L)\b",
+            r"\b([0-9]{2,4}L)\b",
+        ]),
+        ("dra",[
+            r"DRA(?: Level)?\s*:?\s*([0-9]{1,3})\b",
+        ]),
+        ("grade_level",[
+            r"Grade Level(?: Equivalent)?\s*:?\s*([0-9K][0-9K.\-– ]{0,12})",
+            r"Grades\s*:?\s*([K0-9]+\s*(?:-|–|to)\s*[K0-9]+)",
+        ]),
+    ]
+    for key,plist in patterns:
+        for pat in plist:
+            m=re.search(pat,plain,re.I)
+            if m:
+                levels[key]=m.group(1).strip().upper() if key!="grade_level" else m.group(1).strip()
+                break
+    return levels
+
+def scholastic_lookup_isbn(isbn,title=""):
+    """Best-effort Scholastic lookup for explicitly published reading-level data."""
+    isbn=re.sub(r"[^0-9Xx]","",str(isbn or ""))
+    if len(isbn) not in (10,13):
+        return {"found":False,"levels":{},"url":"","status":"Invalid ISBN"}
+
+    attempts=[
+        ("https://clubs.scholastic.com/search",{"q":isbn}),
+        ("https://shop.scholastic.com/teachers-ecommerce/books/search-results.html",{"keyword":isbn}),
+        ("https://www.scholastic.com/site/search.html",{"query":isbn}),
+    ]
+    headers={
+        "User-Agent":"Mozilla/5.0 (compatible; ChapLabTeacherHub/4.0)",
+        "Accept-Language":"en-US,en;q=0.9"
+    }
+
+    visited=[]
+    candidate_pages=[]
+    for url,params in attempts:
+        try:
+            r=requests.get(url,params=params,headers=headers,timeout=10,allow_redirects=True)
+            if r.status_code!=200 or not r.text:
+                continue
+            visited.append(r.url)
+            candidate_pages.append((r.url,r.text))
+
+            for href in re.findall(r"""href=["']([^"']+)["']""",r.text,re.I):
+                normalized_href=href.replace("-","")
+                if isbn not in normalized_href:
+                    continue
+                full=urljoin(r.url,html.unescape(href))
+                if "scholastic.com" in full and full not in visited:
+                    try:
+                        pr=requests.get(full,headers=headers,timeout=10,allow_redirects=True)
+                        if pr.status_code==200 and pr.text:
+                            visited.append(pr.url)
+                            candidate_pages.insert(0,(pr.url,pr.text))
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+
+    for url,raw in candidate_pages:
+        plain=_scholastic_plain_text(raw)
+        compact=re.sub(r"[^0-9Xx]","",plain)
+        levels=_parse_scholastic_levels(raw)
+        title_match=True
+        if title:
+            title_match=title.lower() in plain.lower()
+        if levels and (isbn in compact or title_match):
+            return {
+                "found":True,
+                "levels":levels,
+                "url":url,
+                "status":"Scholastic level data found"
+            }
+
+    for url,raw in candidate_pages:
+        plain=_scholastic_plain_text(raw)
+        if isbn in re.sub(r"[^0-9Xx]","",plain):
+            return {
+                "found":True,
+                "levels":{},
+                "url":url,
+                "status":"Scholastic matched the ISBN, but no level was visible"
+            }
+
+    return {
+        "found":False,
+        "levels":{},
+        "url":"",
+        "status":"No Scholastic level match found"
+    }
+
+def internet_book_lookup_isbn(isbn):
+    """Combine Google Books, Open Library, and Scholastic into one book record."""
+    isbn=re.sub(r"[^0-9Xx]","",str(isbn or ""))
+    google=google_books_lookup_isbn(isbn)
+
+    try:
+        openlib=openlibrary_lookup_isbn(isbn)
+    except Exception:
+        openlib=None
+
+    base={}
+    for source in (google or {},openlib or {}):
+        for k,v in source.items():
+            if v not in (None,"",[],{}) and not base.get(k):
+                base[k]=v
+
+    if not base:
+        base={"title":"Unknown title","author":"","isbn":isbn}
+    base["isbn"]=isbn
+
+    scholastic=scholastic_lookup_isbn(
+        isbn,
+        title=str(base.get("title") or "")
+    )
+    base["google_books"]=google or {}
+    base["open_library"]=openlib or {}
+    base["scholastic"]=scholastic
+    base["lookup_sources"]={
+        "Google Books":bool(google),
+        "Open Library":bool(openlib),
+        "Scholastic":bool(scholastic.get("found")),
+    }
+    return base
+
+def queue_book_isbn_lookup(isbn):
+    """Queue widget fill + internet research for the next rerun."""
+    cleaned=re.sub(r"[^0-9Xx]","",str(isbn or ""))
+    if len(cleaned) not in (10,13):
+        return False
+    st.session_state["_book_pending_query"]=cleaned
+    st.session_state["_book_pending_lookup_isbn"]=cleaned
+    st.session_state["book_camera_isbn"]=cleaned
+    st.session_state["_last_autolookup_isbn"]=cleaned
+    return True
+
 def openlibrary_cover_url(book):
     cover_i=book.get("cover_i") if isinstance(book,dict) else None
     if cover_i:
@@ -5399,7 +5607,36 @@ elif page=="Book Leveler":
     tabs=st.tabs(["Search Internet","My Book Catalog"])
 
     with tabs[0]:
-        st.markdown("### Search Open Library")
+        # Apply scan/manual changes before keyed search widgets are instantiated.
+        _pending_query=st.session_state.pop("_book_pending_query",None)
+        if _pending_query is not None:
+            st.session_state["book_online_query"]=str(_pending_query)
+
+        _pending_lookup=st.session_state.pop("_book_pending_lookup_isbn",None)
+        if _pending_lookup:
+            with st.spinner("Checking Google Books, Scholastic, and Open Library..."):
+                researched=internet_book_lookup_isbn(_pending_lookup)
+            st.session_state["book_online_results"]=[researched] if researched else []
+            st.session_state["book_selected_result_idx"]=0 if researched else None
+            st.session_state["book_selected_result"]=researched if researched else None
+
+            if researched:
+                sch=researched.get("scholastic") or {}
+                levels=sch.get("levels") or {}
+                level_bits=[]
+                if levels.get("fountas_pinnell"):
+                    level_bits.append(f"F&P {levels['fountas_pinnell']}")
+                if levels.get("guided_reading"):
+                    level_bits.append(f"Guided Reading {levels['guided_reading']}")
+                if levels.get("lexile"):
+                    level_bits.append(f"Lexile {levels['lexile']}")
+                suffix=(" • "+", ".join(level_bits)) if level_bits else ""
+                st.session_state["_book_scan_message"]=(
+                    f"✅ ISBN **{_pending_lookup}** researched automatically. "
+                    f"**{researched.get('title','Book')}** loaded{suffix}."
+                )
+
+        st.markdown("### Search Internet")
 
         st.markdown("#### Identify book by")
         identify_mode=st.radio(
@@ -5423,6 +5660,9 @@ elif page=="Book Leveler":
                 "_last_camera_scan_token",
                 "_last_live_scanned_value",
                 "_last_autolookup_isbn",
+                "_book_pending_query",
+                "_book_pending_lookup_isbn",
+                "book_verified_fp_online",
             ):
                 st.session_state.pop(k,None)
 
@@ -5467,36 +5707,9 @@ elif page=="Book Leveler":
                     st.session_state["_last_live_scanned_value"]=raw_value
 
                     if len(cleaned) in (10,13):
-                        st.session_state["book_camera_isbn"]=cleaned
                         st.session_state["book_camera_manual_correction"]=cleaned
                         st.session_state["book_online_search_mode"]="ISBN"
-                        st.session_state["book_online_query"]=cleaned
-                        st.session_state["_last_autolookup_isbn"]=cleaned
-
-                        try:
-                            found=openlibrary_lookup_isbn(cleaned)
-                            st.session_state["book_online_results"]=[found] if found else []
-                            if found:
-                                st.session_state["book_selected_result_idx"]=0
-                                st.session_state["book_selected_result"]=found
-                                st.session_state["_book_scan_message"]=(
-                                    f"✅ ISBN **{cleaned}** detected live. "
-                                    f"**{found.get('title','Book')}** loaded automatically."
-                                )
-                            else:
-                                st.session_state["book_selected_result_idx"]=None
-                                st.session_state["book_selected_result"]=None
-                                st.session_state["_book_scan_message"]=(
-                                    f"✅ ISBN **{cleaned}** detected live, but no matching book was found. "
-                                    "Correct the ISBN below if the scan looks wrong."
-                                )
-                        except Exception as e:
-                            st.session_state["book_online_results"]=[]
-                            st.session_state["book_selected_result_idx"]=None
-                            st.session_state["book_selected_result"]=None
-                            st.session_state["_book_scan_message"]=(
-                                f"✅ ISBN **{cleaned}** detected live. Lookup could not complete: {e}"
-                            )
+                        queue_book_isbn_lookup(cleaned)
                         st.rerun()
                     else:
                         st.session_state["_book_scan_error"]=(
@@ -5522,33 +5735,8 @@ elif page=="Book Leveler":
                     return
                 if cleaned==st.session_state.get("_last_autolookup_isbn"):
                     return
-
-                st.session_state["book_camera_isbn"]=cleaned
                 st.session_state["book_online_search_mode"]="ISBN"
-                st.session_state["book_online_query"]=cleaned
-                st.session_state["_last_autolookup_isbn"]=cleaned
-
-                try:
-                    found=openlibrary_lookup_isbn(cleaned)
-                    st.session_state["book_online_results"]=[found] if found else []
-                    if found:
-                        st.session_state["book_selected_result_idx"]=0
-                        st.session_state["book_selected_result"]=found
-                        st.session_state["_book_scan_message"]=(
-                            f"✅ Corrected ISBN **{cleaned}**. "
-                            f"**{found.get('title','Book')}** loaded automatically."
-                        )
-                    else:
-                        st.session_state["book_selected_result_idx"]=None
-                        st.session_state["book_selected_result"]=None
-                        st.session_state["_book_scan_message"]=(
-                            f"ISBN **{cleaned}** is valid, but no matching Open Library book was found."
-                        )
-                except Exception as e:
-                    st.session_state["book_online_results"]=[]
-                    st.session_state["book_selected_result_idx"]=None
-                    st.session_state["book_selected_result"]=None
-                    st.session_state["_book_scan_message"]=f"Book lookup failed: {e}"
+                queue_book_isbn_lookup(cleaned)
 
             manual_cam=st.text_input(
                 "Detected ISBN / manual correction",
@@ -5617,9 +5805,11 @@ elif page=="Book Leveler":
                     if len(cleaned_q) not in (10,13):
                         st.warning("Enter a valid 10- or 13-digit ISBN.")
                     else:
-                        st.session_state["book_online_query"]=cleaned_q
-                        result=openlibrary_lookup_isbn(cleaned_q)
+                        with st.spinner("Checking Google Books, Scholastic, and Open Library..."):
+                            result=internet_book_lookup_isbn(cleaned_q)
                         st.session_state["book_online_results"]=[result] if result else []
+                        st.session_state["book_selected_result_idx"]=0 if result else None
+                        st.session_state["book_selected_result"]=result if result else None
                         if not result:
                             st.warning("No matching book was found for that ISBN.")
                 else:
@@ -5669,11 +5859,46 @@ elif page=="Book Leveler":
                 if book.get("isbn"):
                     st.write(f"**ISBN:** {book.get('isbn')}")
 
-            st.info(
-                "Open Library does not reliably provide Fountas & Pinnell levels. "
-                "ChapLab will not guess an F&P level. Enter a verified level if you know it, "
-                "then save the book so future checks are automatic."
-            )
+            research=book.get("lookup_sources") or {}
+            if research:
+                source_text=" • ".join(
+                    [f"{name}: {'✓' if ok else '—'}" for name,ok in research.items()]
+                )
+                st.caption("Internet checks: "+source_text)
+
+            scholastic=book.get("scholastic") or {}
+            sch_levels=scholastic.get("levels") or {}
+            if sch_levels:
+                st.markdown("#### 📚 Reading Levels Found Online")
+                if sch_levels.get("fountas_pinnell"):
+                    st.success(f"**Scholastic Fountas & Pinnell:** {sch_levels['fountas_pinnell']}")
+                if sch_levels.get("guided_reading"):
+                    st.success(f"**Scholastic Guided Reading Level:** {sch_levels['guided_reading']}")
+                if sch_levels.get("lexile"):
+                    st.write(f"**Scholastic Lexile:** {sch_levels['lexile']}")
+                if sch_levels.get("dra"):
+                    st.write(f"**Scholastic DRA:** {sch_levels['dra']}")
+                if sch_levels.get("grade_level"):
+                    st.write(f"**Scholastic Grade Level:** {sch_levels['grade_level']}")
+            else:
+                st.info(
+                    "Google Books/Open Library may identify the edition even when Scholastic does not publish "
+                    "a reading level for that ISBN. ChapLab will not invent a level."
+                )
+
+            google_info=book.get("google_books") or {}
+            if google_info:
+                extra=[]
+                if google_info.get("page_count"):
+                    extra.append(f"{google_info['page_count']} pages")
+                if google_info.get("categories"):
+                    extra.append(", ".join(google_info["categories"][:2]))
+                if extra:
+                    st.caption("Google Books: "+" • ".join(extra))
+
+            _sch_fp=(sch_levels.get("fountas_pinnell") or "").strip().upper() if 'sch_levels' in locals() else ""
+            if _sch_fp and not st.session_state.get("book_verified_fp_online"):
+                st.session_state["book_verified_fp_online"]=_sch_fp
 
             verified_fp=st.text_input(
                 "Verified F&P level (optional)",
