@@ -5400,7 +5400,7 @@ elif page=="Book Leveler":
         )
 
         def clear_book_scanner():
-            """Clear every current-book field/result so the next scan starts completely clean."""
+            """Clear current book and force a fresh live-scanner instance."""
             for k in (
                 "book_camera_isbn",
                 "book_camera_manual_correction",
@@ -5411,103 +5411,117 @@ elif page=="Book Leveler":
                 "_book_scan_message",
                 "_book_scan_error",
                 "_last_camera_scan_token",
-                "book_isbn_camera_capture",
-                "book_isbn_camera_capture_fallback",
-                "show_hi_res_fallback",
-                "open_hi_res_fallback",
+                "_last_live_scanned_value",
                 "_last_autolookup_isbn",
             ):
                 st.session_state.pop(k,None)
-            # Explicitly blank the visible ISBN/search widgets on the next run.
+
             st.session_state["book_online_query"]=""
             st.session_state["book_camera_manual_correction"]=""
             st.session_state["book_camera_isbn"]=""
             st.session_state["book_online_results"]=[]
             st.session_state["book_online_search_mode"]="ISBN"
+            st.session_state["book_live_scanner_nonce"]=int(
+                st.session_state.get("book_live_scanner_nonce",0)
+            )+1
+
 
         if identify_mode=="Camera":
             scan_title_col,scan_clear_col=st.columns([3,1])
             with scan_title_col:
-                st.markdown("#### 📷 ISBN Camera Scanner")
+                st.markdown("#### 📷 Live ISBN Scanner")
             with scan_clear_col:
                 if st.button("🧹 Clear / Scan New Book",key="clear_camera_book",use_container_width=True):
                     clear_book_scanner()
                     st.rerun()
 
             st.info(
-                "Use whichever camera is clearer on your device. On phones, the browser may let you switch "
-                "between the front and back camera. ChapLab will scan either one."
+                "Point the camera at the book's **ISBN barcode**. There is no photo-capture step — "
+                "ChapLab reads the live camera feed and searches for the book automatically."
             )
             st.caption(
-                "Keep the full ISBN barcode visible and sharp. If the lines blur together, move slightly farther away."
+                "The live scanner view is shown normally — **not mirrored** — so the barcode stays in its natural orientation."
             )
 
-            camera_photo=st.camera_input(
-                "Capture ISBN barcode",
-                key="book_isbn_camera_capture",
-                resolution="1080p",
-                width=560
-            )
+            live_scanner=None
+            live_error=None
+            try:
+                from streamlit_qrcode_scanner import qrcode_scanner
+                live_scanner=qrcode_scanner
+            except Exception as e:
+                live_error=str(e)
 
-            if camera_photo is not None:
-                with st.expander("🔍 Check Captured Barcode",expanded=False):
-                    st.image(
-                        camera_photo,
-                        caption="Captured frame — the barcode lines should be distinct, not blended together.",
-                        width=560
-                    )
+            if live_scanner is None:
+                st.error(
+                    "The live scanner could not start. Make sure requirements.txt from this version was deployed."
+                )
+                if live_error:
+                    st.caption(live_error)
+            else:
+                nonce=int(st.session_state.get("book_live_scanner_nonce",0))
+                st.markdown(
+                    """
+                    <div style="
+                        max-width:560px;margin:0 auto 8px auto;
+                        border:2px dashed #ff4b4b;border-radius:14px;
+                        padding:9px 12px;text-align:center;
+                        background:rgba(255,75,75,.05);font-weight:700;">
+                        Keep the full 978 / 979 ISBN barcode in the camera view
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
 
-                try:
-                    import hashlib
-                    raw=camera_photo.getvalue()
-                    scan_token=hashlib.sha1(raw).hexdigest()
-                except Exception:
-                    scan_token=str(type(camera_photo))
+                scanned_value=live_scanner(key=f"book_live_isbn_scanner_{nonce}")
 
-                if st.session_state.get("_last_camera_scan_token")!=scan_token:
-                    st.session_state["_last_camera_scan_token"]=scan_token
-                    with st.spinner("Auto-detecting ISBN..."):
-                        detected,error=decode_isbn_barcode(camera_photo)
+                if scanned_value:
+                    raw_value=str(scanned_value).strip()
+                    cleaned=re.sub(r"[^0-9Xx]","",raw_value)
 
-                    if detected:
-                        # One-step camera flow:
-                        # scan -> fill ISBN -> lookup book -> show result.
-                        st.session_state["book_camera_isbn"]=detected
-                        st.session_state["book_camera_manual_correction"]=detected
-                        st.session_state["book_online_search_mode"]="ISBN"
-                        st.session_state["book_online_query"]=detected
-                        st.session_state["_last_autolookup_isbn"]=detected
+                    if raw_value!=st.session_state.get("_last_live_scanned_value"):
+                        st.session_state["_last_live_scanned_value"]=raw_value
 
-                        try:
-                            found=openlibrary_lookup_isbn(detected)
-                            st.session_state["book_online_results"]=[found] if found else []
-                            if found:
-                                st.session_state["book_selected_result_idx"]=0
-                                st.session_state["book_selected_result"]=found
-                                st.session_state["_book_scan_message"]=(
-                                    f"✅ ISBN **{detected}** detected. **{found.get('title','Book')}** loaded automatically."
-                                )
-                            else:
+                        if len(cleaned) in (10,13):
+                            st.session_state["book_camera_isbn"]=cleaned
+                            st.session_state["book_camera_manual_correction"]=cleaned
+                            st.session_state["book_online_search_mode"]="ISBN"
+                            st.session_state["book_online_query"]=cleaned
+                            st.session_state["_last_autolookup_isbn"]=cleaned
+
+                            try:
+                                found=openlibrary_lookup_isbn(cleaned)
+                                st.session_state["book_online_results"]=[found] if found else []
+                                if found:
+                                    st.session_state["book_selected_result_idx"]=0
+                                    st.session_state["book_selected_result"]=found
+                                    st.session_state["_book_scan_message"]=(
+                                        f"✅ ISBN **{cleaned}** detected live. "
+                                        f"**{found.get('title','Book')}** loaded automatically."
+                                    )
+                                else:
+                                    st.session_state["book_selected_result_idx"]=None
+                                    st.session_state["book_selected_result"]=None
+                                    st.session_state["_book_scan_message"]=(
+                                        f"✅ ISBN **{cleaned}** detected live, but no matching book was found. "
+                                        "Correct the ISBN below if the scan looks wrong."
+                                    )
+                            except Exception as e:
+                                st.session_state["book_online_results"]=[]
                                 st.session_state["book_selected_result_idx"]=None
                                 st.session_state["book_selected_result"]=None
                                 st.session_state["_book_scan_message"]=(
-                                    f"✅ ISBN **{detected}** detected, but no matching book was found. "
-                                    "Correct the ISBN below if the scan looks wrong."
+                                    f"✅ ISBN **{cleaned}** detected live. Lookup could not complete: {e}"
                                 )
-                        except Exception as e:
-                            st.session_state["book_online_results"]=[]
-                            st.session_state["book_selected_result_idx"]=None
-                            st.session_state["book_selected_result"]=None
-                            st.session_state["_book_scan_message"]=(
-                                f"✅ ISBN **{detected}** detected. Lookup could not complete: {e}"
+                            st.rerun()
+                        else:
+                            st.session_state["_book_scan_error"]=(
+                                f"The camera read `{raw_value}`, but it is not a 10- or 13-digit ISBN. "
+                                "Keep the book's 978/979 barcode in view."
                             )
-                        st.rerun()
-                    else:
-                        st.session_state["_book_scan_error"]=error
+                            st.rerun()
 
             if st.session_state.get("_book_scan_error"):
                 st.warning(st.session_state.pop("_book_scan_error"))
-                st.caption("Capture again and ChapLab will retry auto-detection on the new image.")
 
             if st.session_state.get("_book_scan_message"):
                 st.success(st.session_state["_book_scan_message"])
@@ -5519,7 +5533,6 @@ elif page=="Book Leveler":
             def _camera_manual_isbn_changed():
                 raw=st.session_state.get("book_camera_manual_correction","")
                 cleaned=re.sub(r"[^0-9Xx]","",raw or "")
-                # Do nothing until the correction is a complete ISBN.
                 if len(cleaned) not in (10,13):
                     return
                 if cleaned==st.session_state.get("_last_autolookup_isbn"):
@@ -5529,7 +5542,6 @@ elif page=="Book Leveler":
                 st.session_state["book_online_search_mode"]="ISBN"
                 st.session_state["book_online_query"]=cleaned
                 st.session_state["_last_autolookup_isbn"]=cleaned
-
                 try:
                     found=openlibrary_lookup_isbn(cleaned)
                     st.session_state["book_online_results"]=[found] if found else []
@@ -5537,7 +5549,8 @@ elif page=="Book Leveler":
                         st.session_state["book_selected_result_idx"]=0
                         st.session_state["book_selected_result"]=found
                         st.session_state["_book_scan_message"]=(
-                            f"✅ Corrected ISBN **{cleaned}**. **{found.get('title','Book')}** loaded automatically."
+                            f"✅ Corrected ISBN **{cleaned}**. "
+                            f"**{found.get('title','Book')}** loaded automatically."
                         )
                     else:
                         st.session_state["book_selected_result_idx"]=None
@@ -5560,8 +5573,8 @@ elif page=="Book Leveler":
 
             if st.session_state.get("book_camera_isbn"):
                 st.caption(
-                    "The scanned ISBN is looked up automatically. If the wrong book appears, "
-                    "correct the ISBN here and ChapLab will automatically search again."
+                    "The live scan already searched for the book. If the wrong book appears, "
+                    "correct the ISBN here and ChapLab automatically searches again."
                 )
                 st.caption("Ready for another book? Use **Clear / Scan New Book** above.")
 
