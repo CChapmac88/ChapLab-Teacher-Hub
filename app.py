@@ -19,6 +19,11 @@ except Exception:
     PdfReader=None
 
 try:
+    import zxingcpp
+except Exception:
+    zxingcpp=None
+
+try:
     from supabase import create_client
 except Exception:
     create_client=None
@@ -2255,6 +2260,72 @@ def import_ocr_preview(preview_df, assignments_by_col):
     c.close()
     return saved,skipped
 
+
+
+def decode_isbn_barcode(image_file):
+    """Decode EAN/UPC/ISBN barcode from an uploaded/camera image."""
+    if image_file is None:
+        return None, "No barcode image was provided."
+    if zxingcpp is None:
+        return None, "Barcode reader is not installed yet. Redeploy after updating requirements.txt."
+    try:
+        from PIL import Image, ImageEnhance, ImageOps
+        import numpy as np
+
+        raw=image_file.getvalue() if hasattr(image_file,"getvalue") else bytes(image_file.getbuffer())
+        img=Image.open(BytesIO(raw)).convert("RGB")
+
+        # Try several useful variants. ISBN book barcodes are normally EAN-13.
+        candidates=[img]
+        gray=ImageOps.grayscale(img)
+        candidates.append(gray)
+        candidates.append(ImageEnhance.Contrast(gray).enhance(2.0))
+
+        # Upscale smaller camera captures to improve barcode detection.
+        if img.width < 1600:
+            scale=max(1.5,1600/max(img.width,1))
+            candidates.append(img.resize((int(img.width*scale),int(img.height*scale))))
+            candidates.append(gray.resize((int(gray.width*scale),int(gray.height*scale))))
+
+        decoded=[]
+        for candidate in candidates:
+            try:
+                results=zxingcpp.read_barcodes(np.array(candidate))
+            except Exception:
+                results=[]
+            for result in results:
+                value=str(getattr(result,"text","") or "").strip()
+                cleaned=re.sub(r"[^0-9Xx]","",value)
+                if cleaned and cleaned not in decoded:
+                    decoded.append(cleaned)
+
+        # Prefer ISBN-13 / Bookland EAN starting 978 or 979, then valid-length codes.
+        for code in decoded:
+            if len(code)==13 and code.startswith(("978","979")):
+                return code, None
+        for code in decoded:
+            if len(code) in (10,13):
+                return code, None
+
+        if decoded:
+            return None, "A barcode was detected, but it did not contain a 10- or 13-digit ISBN."
+        return None, "I couldn't read the ISBN barcode. Move closer, keep the barcode flat, and make sure the full barcode is in focus."
+    except Exception as e:
+        return None, f"Barcode scan failed: {e}"
+
+def lookup_and_store_isbn(isbn):
+    """Look up an ISBN and sync the Book Leveler search controls/results."""
+    cleaned=re.sub(r"[^0-9Xx]","",str(isbn or ""))
+    if len(cleaned) not in (10,13):
+        return False, "A valid ISBN must contain 10 or 13 digits."
+    found=openlibrary_lookup_isbn(cleaned)
+    st.session_state["book_online_search_mode"]="ISBN"
+    st.session_state["book_online_query"]=cleaned
+    st.session_state["book_camera_isbn"]=cleaned
+    st.session_state["book_online_results"]=[found] if found else []
+    if found:
+        return True, f"ISBN {cleaned} found."
+    return False, f"ISBN {cleaned} was read correctly, but no matching Open Library book was found."
 
 def openlibrary_search_books(query, limit=8):
     """Search Open Library by title, author, ISBN, or keywords."""
@@ -4934,45 +5005,120 @@ elif page=="Book Leveler":
     with tabs[0]:
         st.markdown("### Search Open Library")
 
-        # Camera is intentionally user-activated. It is NOT rendered
-        # until the teacher clicks the button below.
-        if st.button("📷 Scan ISBN with Camera",key="toggle_book_camera"):
-            st.session_state["show_book_camera"]=not st.session_state.get("show_book_camera",False)
-            st.rerun()
+        st.markdown("#### Identify book by")
+        identify_mode=st.radio(
+            "Choose how to enter the book",
+            ["Camera","Upload Barcode Photo","Type ISBN / Search"],
+            horizontal=True,
+            key="book_identify_mode"
+        )
 
-        if st.session_state.get("show_book_camera",False):
-            with st.container(border=True):
-                cam_top1,cam_top2=st.columns([5,1])
-                cam_top1.markdown("#### 📷 ISBN Camera")
-                if cam_top2.button("✕ Close",key="close_book_camera"):
-                    st.session_state["show_book_camera"]=False
-                    st.rerun()
-                st.caption("Point the camera at the ISBN barcode. The camera stays off unless you open it.")
-                camera_photo=st.camera_input(
-                    "Capture the ISBN barcode",
-                    key="book_isbn_camera_capture"
-                )
-                if camera_photo is not None:
-                    st.success("Barcode photo captured.")
-                    st.caption("Type the ISBN printed above the barcode below to search for the book.")
-                    captured_isbn=st.text_input(
-                        "ISBN from captured book",
-                        placeholder="978...",
-                        key="book_camera_isbn"
+        if identify_mode=="Camera":
+            # Camera remains user-activated and does not open automatically.
+            if st.button("📷 Open ISBN Camera",key="toggle_book_camera"):
+                st.session_state["show_book_camera"]=not st.session_state.get("show_book_camera",False)
+                st.rerun()
+
+            if st.session_state.get("show_book_camera",False):
+                with st.container(border=True):
+                    cam_top1,cam_top2=st.columns([5,1])
+                    cam_top1.markdown("#### 📷 Scan Book Barcode")
+                    if cam_top2.button("✕ Close",key="close_book_camera"):
+                        st.session_state["show_book_camera"]=False
+                        st.rerun()
+
+                    st.caption(
+                        "Center the entire ISBN barcode in the camera, keep it flat and in focus, then capture the photo. "
+                        "ChapLab will read the number automatically."
                     )
-                    cleaned_camera_isbn=re.sub(r"[^0-9Xx]","",captured_isbn or "")
-                    if st.button("Find Captured Book",key="find_camera_book"):
-                        if len(cleaned_camera_isbn) not in (10,13):
+                    camera_photo=st.camera_input(
+                        "Capture ISBN barcode",
+                        key="book_isbn_camera_capture"
+                    )
+
+                    if camera_photo is not None:
+                        scan_token=(camera_photo.name if getattr(camera_photo,"name",None) else "camera",
+                                    len(camera_photo.getvalue()))
+                        if st.session_state.get("_last_camera_scan_token")!=scan_token:
+                            st.session_state["_last_camera_scan_token"]=scan_token
+                            with st.spinner("Reading ISBN barcode..."):
+                                detected,error=decode_isbn_barcode(camera_photo)
+                            if detected:
+                                st.session_state["book_camera_isbn"]=detected
+                                st.session_state["book_online_search_mode"]="ISBN"
+                                st.session_state["book_online_query"]=detected
+                                try:
+                                    found=openlibrary_lookup_isbn(detected)
+                                    st.session_state["book_online_results"]=[found] if found else []
+                                    st.session_state["_book_scan_message"]=(
+                                        f"✅ ISBN **{detected}** detected and book information loaded."
+                                        if found else
+                                        f"✅ ISBN **{detected}** detected. No Open Library match was found, but the ISBN has been populated."
+                                    )
+                                except Exception as e:
+                                    st.session_state["book_online_results"]=[]
+                                    st.session_state["_book_scan_message"]=f"✅ ISBN **{detected}** detected. Lookup error: {e}"
+                                st.rerun()
+                            else:
+                                st.session_state["_book_scan_error"]=error
+
+                    if st.session_state.get("_book_scan_error"):
+                        st.warning(st.session_state.pop("_book_scan_error"))
+                    if st.session_state.get("_book_scan_message"):
+                        st.success(st.session_state["_book_scan_message"])
+
+                    # Manual correction is still available if a damaged barcode cannot be decoded.
+                    manual_cam=st.text_input(
+                        "Detected ISBN / manual correction",
+                        value=st.session_state.get("book_camera_isbn",""),
+                        placeholder="978...",
+                        key="book_camera_manual_correction"
+                    )
+                    if st.button("Use This ISBN",key="use_camera_manual_isbn"):
+                        cleaned=re.sub(r"[^0-9Xx]","",manual_cam or "")
+                        if len(cleaned) not in (10,13):
                             st.warning("Enter a valid 10- or 13-digit ISBN.")
                         else:
+                            st.session_state["book_camera_isbn"]=cleaned
+                            st.session_state["book_online_search_mode"]="ISBN"
+                            st.session_state["book_online_query"]=cleaned
                             try:
-                                found=openlibrary_lookup_isbn(cleaned_camera_isbn)
+                                found=openlibrary_lookup_isbn(cleaned)
                                 st.session_state["book_online_results"]=[found] if found else []
-                                if not found:
-                                    st.warning("No matching book was found.")
                             except Exception as e:
                                 st.error(str(e))
+                            st.rerun()
 
+        elif identify_mode=="Upload Barcode Photo":
+            barcode_upload=st.file_uploader(
+                "Upload a clear photo of the ISBN barcode",
+                type=["png","jpg","jpeg","webp"],
+                key="book_barcode_photo_upload"
+            )
+            if barcode_upload is not None:
+                st.image(barcode_upload,caption="Barcode photo",width=350)
+                if st.button("🔎 Read Barcode & Find Book",key="read_uploaded_book_barcode"):
+                    with st.spinner("Reading ISBN barcode..."):
+                        detected,error=decode_isbn_barcode(barcode_upload)
+                    if not detected:
+                        st.warning(error)
+                    else:
+                        st.session_state["book_camera_isbn"]=detected
+                        st.session_state["book_online_search_mode"]="ISBN"
+                        st.session_state["book_online_query"]=detected
+                        try:
+                            found=openlibrary_lookup_isbn(detected)
+                            st.session_state["book_online_results"]=[found] if found else []
+                            if found:
+                                st.success(f"ISBN {detected} detected and book information loaded.")
+                            else:
+                                st.warning(f"ISBN {detected} detected, but Open Library did not return a matching book.")
+                        except Exception as e:
+                            st.error(str(e))
+                        st.rerun()
+
+        # These normal search controls remain visible for typing, correction,
+        # or searching by title/author even after a barcode scan.
         search_mode=st.radio(
             "Search by",
             ["Title / Author / Keyword","ISBN"],
@@ -4980,6 +5126,8 @@ elif page=="Book Leveler":
             key="book_online_search_mode"
         )
 
+        # IMPORTANT: scanned ISBN is written into this exact widget key before rerun,
+        # so the main search field visibly populates.
         q=st.text_input(
             "Book title, author, keywords, or ISBN",
             placeholder="Example: Charlotte's Web or 9780064400558",
@@ -4989,12 +5137,19 @@ elif page=="Book Leveler":
         if st.button("Search Internet",key="book_search_internet"):
             try:
                 if search_mode=="ISBN":
-                    result=openlibrary_lookup_isbn(q)
-                    st.session_state["book_online_results"]=[result] if result else []
+                    cleaned_q=re.sub(r"[^0-9Xx]","",q or "")
+                    if len(cleaned_q) not in (10,13):
+                        st.warning("Enter a valid 10- or 13-digit ISBN.")
+                    else:
+                        st.session_state["book_online_query"]=cleaned_q
+                        result=openlibrary_lookup_isbn(cleaned_q)
+                        st.session_state["book_online_results"]=[result] if result else []
+                        if not result:
+                            st.warning("No matching book was found for that ISBN.")
                 else:
                     st.session_state["book_online_results"]=openlibrary_search_books(q,limit=10)
-                if not st.session_state["book_online_results"]:
-                    st.warning("No matching books were found.")
+                    if not st.session_state["book_online_results"]:
+                        st.warning("No matching books were found.")
             except Exception as e:
                 st.error(str(e))
 
