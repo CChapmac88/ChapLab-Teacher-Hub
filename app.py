@@ -58,18 +58,6 @@ st.markdown("""
 
 st.markdown("""
 <style>
-/* Custom rear-camera component host video, when exposed in the Streamlit DOM. */
-iframe[title*="streamlit_back_camera_input" i] + div video,
-div[data-testid="stCustomComponentV1"] video,
-div[data-testid="stCustomComponent"] video {
-    transform: scaleX(-1) !important;
-    transform-origin: center center !important;
-}
-</style>
-""", unsafe_allow_html=True)
-
-st.markdown("""
-<style>
 section[data-testid="stSidebar"]{
     display:block !important;
     visibility:visible !important;
@@ -5431,98 +5419,46 @@ elif page=="Book Leveler":
         if identify_mode=="Camera":
             scan_title_col,scan_clear_col=st.columns([3,1])
             with scan_title_col:
-                st.markdown("#### 📷 Rear Camera Scanner")
+                st.markdown("#### 📷 ISBN Camera Scanner")
             with scan_clear_col:
                 if st.button("🧹 Clear / Scan New Book",key="clear_camera_book",use_container_width=True):
                     clear_book_scanner()
                     st.rerun()
 
             st.info(
-                "Use the **rear camera** on phones. Keep the whole ISBN barcode inside the guide area. "
-                "The preview is mirrored for positioning, but the captured image stays normal for decoding."
+                "Use whichever camera is clearer on your device. On phones, the browser may let you switch "
+                "between the front and back camera. ChapLab will scan either one."
             )
             st.caption(
-                "Best distance: about 8–14 inches away. If the barcode lines look smeared together, move a little farther back."
+                "Keep the full ISBN barcode visible and sharp. If the lines blur together, move slightly farther away."
             )
 
-            # Compact visual guide above the camera. The actual decoder prioritizes the same center area.
-            st.markdown(
-                """
-                <div style="
-                    max-width:560px;margin:0 auto 8px auto;
-                    border:2px dashed #ff4b4b;border-radius:14px;
-                    padding:10px 14px;text-align:center;
-                    background:rgba(255,75,75,.05);font-weight:700;">
-                    ▬ Keep the full ISBN barcode centered here ▬
-                </div>
-                """,
-                unsafe_allow_html=True
+            camera_photo=st.camera_input(
+                "Capture ISBN barcode",
+                key="book_isbn_camera_capture",
+                resolution="1080p",
+                width=560
             )
 
-            rear_component=None
-            rear_component_error=None
-            try:
-                from streamlit_back_camera_input import back_camera_input
-                rear_component=back_camera_input
-            except Exception as e:
-                rear_component_error=str(e)
-
-            rear_photo=None
-            if rear_component is not None:
-                try:
-                    rear_photo=rear_component()
-                except Exception as e:
-                    rear_component_error=str(e)
-                    rear_photo=None
-
-            # If custom rear-only component returns nothing or fails, offer explicit fallback button
-            # instead of immediately creating a huge second camera.
-            if rear_photo is None and rear_component_error:
-                st.warning(
-                    "Rear-camera component could not start in this browser. "
-                    "Use the high-resolution fallback below."
-                )
-                if st.button("Open High-Resolution Camera Fallback",key="open_hi_res_fallback"):
-                    st.session_state["show_hi_res_fallback"]=True
-                    st.rerun()
-
-            if st.session_state.get("show_hi_res_fallback",False):
-                rear_photo=st.camera_input(
-                    "Capture ISBN barcode",
-                    key="book_isbn_camera_capture_fallback",
-                    resolution="1080p",
-                    width=560
-                )
-
-            if rear_photo is not None:
-                # Show only a compact preview of the captured frame.
+            if camera_photo is not None:
                 with st.expander("🔍 Check Captured Barcode",expanded=False):
                     st.image(
-                        rear_photo,
+                        camera_photo,
                         caption="Captured frame — the barcode lines should be distinct, not blended together.",
                         width=560
                     )
 
-                # Build a more reliable token from image bytes or PIL dimensions.
                 try:
-                    if hasattr(rear_photo,"getvalue"):
-                        import hashlib
-                        raw=rear_photo.getvalue()
-                        scan_token=hashlib.sha1(raw).hexdigest()
-                    elif hasattr(rear_photo,"tobytes"):
-                        import hashlib
-                        scan_token=hashlib.sha1(rear_photo.tobytes()).hexdigest()
-                    else:
-                        scan_token=str(rear_photo)
+                    import hashlib
+                    raw=camera_photo.getvalue()
+                    scan_token=hashlib.sha1(raw).hexdigest()
                 except Exception:
-                    scan_token=str(type(rear_photo))
+                    scan_token=str(type(camera_photo))
 
                 if st.session_state.get("_last_camera_scan_token")!=scan_token:
                     st.session_state["_last_camera_scan_token"]=scan_token
-
-                    # Auto-detection: try immediately after capture.
                     with st.spinner("Auto-detecting ISBN..."):
-                        detected,error=decode_isbn_barcode(rear_photo)
+                        detected,error=decode_isbn_barcode(camera_photo)
 
                     if detected:
                         st.session_state["book_camera_isbn"]=detected
@@ -5540,21 +5476,19 @@ elif page=="Book Leveler":
                         except Exception as e:
                             st.session_state["book_online_results"]=[]
                             st.session_state["_book_scan_message"]=f"✅ ISBN **{detected}** detected. Lookup error: {e}"
-                        st.session_state["show_hi_res_fallback"]=False
                         st.rerun()
                     else:
                         st.session_state["_book_scan_error"]=error
 
             if st.session_state.get("_book_scan_error"):
                 st.warning(st.session_state.pop("_book_scan_error"))
-                st.caption("You can capture again immediately; ChapLab will retry auto-detection on the new frame.")
+                st.caption("Capture again and ChapLab will retry auto-detection on the new image.")
 
             if st.session_state.get("_book_scan_message"):
                 st.success(st.session_state["_book_scan_message"])
 
             detected_value=st.session_state.get("book_camera_isbn","")
             if detected_value and st.session_state.get("book_camera_manual_correction")!=detected_value:
-                # Safe here before widget creation.
                 st.session_state["book_camera_manual_correction"]=detected_value
 
             manual_cam=st.text_input(
