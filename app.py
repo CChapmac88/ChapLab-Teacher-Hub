@@ -71,15 +71,53 @@ def cloud_config():
         return None
     return {"url":url,"key":key,"bucket":bucket,"db_object":db_object}
 
+def _stored_login_username(default_username):
+    """Read the chosen ChapLab username before normal DB helpers initialize."""
+    for db_path in (WEB_DB,LEGACY_DB):
+        try:
+            if not Path(db_path).exists():
+                continue
+            c=sqlite3.connect(str(db_path))
+            table=c.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'"
+            ).fetchone()
+            if not table:
+                c.close()
+                continue
+            r=c.execute(
+                "SELECT value FROM settings WHERE key='auth_effective_username'"
+            ).fetchone()
+            c.close()
+            if r and r[0]:
+                try:
+                    value=json.loads(r[0])
+                except Exception:
+                    value=r[0]
+                cleaned=str(value or "").strip()
+                if cleaned:
+                    return cleaned
+        except Exception:
+            continue
+    return str(default_username or "").strip()
+
 def auth_config():
     cfg=_secret_section("chaplab_auth")
     if not cfg:
         return None
-    username=str(cfg.get("username","")).strip()
+    recovery_username=str(cfg.get("username","")).strip()
     password=str(cfg.get("password",""))
-    if not username or not password:
+    if not recovery_username or not password:
         return None
-    return {"username":username,"password":password}
+
+    # The Streamlit Secret remains the recovery credential.
+    # After the one-time first-login choice, the user's selected ChapLab
+    # username is stored in the database and becomes the everyday login name.
+    username=_stored_login_username(recovery_username)
+    return {
+        "username":username,
+        "recovery_username":recovery_username,
+        "password":password
+    }
 
 def cloud_configured():
     return cloud_config() is not None
@@ -107,9 +145,18 @@ def require_login():
         password=st.text_input("Password",type="password")
         submitted=st.form_submit_button("Sign In",use_container_width=True)
     if submitted:
-        if username==auth["username"] and password==auth["password"]:
+        entered_username=str(username or "").strip()
+        valid_usernames={
+            str(auth.get("username","")).strip(),
+            str(auth.get("recovery_username","")).strip()
+        }
+        valid_usernames.discard("")
+        if entered_username in valid_usernames and password==auth["password"]:
             st.session_state["chaplab_authenticated"]=True
-            st.session_state["chaplab_username"]=username
+            # Always use the current everyday username inside ChapLab, even if
+            # Creator used the recovery username to sign in.
+            st.session_state["chaplab_username"]=str(auth.get("username") or entered_username).strip()
+            st.session_state["_just_logged_in"]=True
             st.rerun()
         else:
             st.error("Username or password is incorrect.")
@@ -509,6 +556,19 @@ def init_db():
         assignment_id INTEGER
     );
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);
+    CREATE TABLE IF NOT EXISTS username_change_requests(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        requester_key TEXT NOT NULL,
+        requester_name TEXT DEFAULT '',
+        current_username TEXT DEFAULT '',
+        requested_username TEXT NOT NULL,
+        reason TEXT DEFAULT '',
+        created_at TEXT NOT NULL,
+        status TEXT DEFAULT 'Pending',
+        reviewed_at TEXT DEFAULT '',
+        reviewed_by TEXT DEFAULT '',
+        review_note TEXT DEFAULT ''
+    );
     CREATE TABLE IF NOT EXISTS newsletter_blurbs(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         author_key TEXT NOT NULL,
@@ -927,7 +987,164 @@ def seed():
         c.execute("INSERT OR IGNORE INTO standards(subject,code,skill,description) VALUES (?,?,?,?)",r)
     c.commit(); c.close()
 
+
 init_db(); seed()
+
+# ---------- Username Setup / Change Requests ----------
+def _username_clean(value):
+    return str(value or "").strip()
+
+def _username_valid(value):
+    value=_username_clean(value)
+    # Simple login-friendly usernames: no spaces, 3–30 characters.
+    return bool(re.fullmatch(r"[A-Za-z0-9._-]{3,30}",value))
+
+def auth_username_state():
+    c=conn()
+    rows=c.execute(
+        """SELECT key,value FROM settings
+           WHERE key IN ('auth_effective_username','auth_initial_username_choice_used')"""
+    ).fetchall()
+    c.close()
+    out={
+        "username":str((auth_config() or {}).get("username","")).strip(),
+        "initial_choice_used":False
+    }
+    for r in rows:
+        try:
+            v=json.loads(r["value"])
+        except Exception:
+            v=r["value"]
+        if r["key"]=="auth_effective_username":
+            out["username"]=_username_clean(v) or out["username"]
+        elif r["key"]=="auth_initial_username_choice_used":
+            out["initial_choice_used"]=bool(v)
+    return out
+
+def save_initial_username_choice(username):
+    username=_username_clean(username)
+    c=conn()
+    c.execute(
+        "INSERT OR REPLACE INTO settings(key,value) VALUES ('auth_effective_username',?)",
+        (json.dumps(username),)
+    )
+    c.execute(
+        "INSERT OR REPLACE INTO settings(key,value) VALUES ('auth_initial_username_choice_used',?)",
+        (json.dumps(True),)
+    )
+    c.commit(); c.close()
+    st.session_state["chaplab_username"]=username
+
+def submit_username_change_request(requested_username,reason=""):
+    current=auth_username_state()["username"]
+    requested=_username_clean(requested_username)
+    c=conn()
+    existing=c.execute(
+        """SELECT id FROM username_change_requests
+           WHERE requester_key=? AND status='Pending'""",
+        (str(st.session_state.get("chaplab_username") or current).lower(),)
+    ).fetchone()
+    if existing:
+        c.execute(
+            """UPDATE username_change_requests
+               SET requested_username=?,reason=?,created_at=? WHERE id=?""",
+            (requested,_username_clean(reason),datetime.now().isoformat(timespec="minutes"),int(existing["id"]))
+        )
+    else:
+        c.execute(
+            """INSERT INTO username_change_requests(
+               requester_key,requester_name,current_username,requested_username,
+               reason,created_at,status)
+               VALUES (?,?,?,?,?,?,'Pending')""",
+            (str(st.session_state.get("chaplab_username") or current).lower(),
+             current_author_name() if "current_author_name" in globals() else "Teacher",
+             current,requested,_username_clean(reason),datetime.now().isoformat(timespec="minutes"))
+        )
+    c.commit(); c.close()
+
+def pending_username_requests():
+    c=conn()
+    df=pd.read_sql_query(
+        """SELECT * FROM username_change_requests
+           WHERE status='Pending' ORDER BY id DESC""",c
+    )
+    c.close()
+    return df
+
+def review_username_request(request_id,approve,review_note=""):
+    c=conn()
+    r=c.execute("SELECT * FROM username_change_requests WHERE id=?",(int(request_id),)).fetchone()
+    if not r:
+        c.close()
+        return False
+    status="Approved" if approve else "Denied"
+    now=datetime.now().isoformat(timespec="minutes")
+    c.execute(
+        """UPDATE username_change_requests
+           SET status=?,reviewed_at=?,reviewed_by=?,review_note=? WHERE id=?""",
+        (status,now,current_author_name() if "current_author_name" in globals() else "Creator",
+         _username_clean(review_note),int(request_id))
+    )
+    if approve:
+        # Current single-account build has one effective login username.
+        # Future multi-account rollout will map this same approval workflow
+        # to the individual staff account record instead.
+        c.execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES ('auth_effective_username',?)",
+            (json.dumps(_username_clean(r["requested_username"])),)
+        )
+    c.commit(); c.close()
+    return True
+
+def enforce_initial_username_choice():
+    auth=auth_config()
+    if not auth or not st.session_state.get("chaplab_authenticated"):
+        return
+
+    state=auth_username_state()
+    if state["initial_choice_used"]:
+        return
+
+    st.markdown("## 👋 One-Time Username Choice")
+    st.info(
+        "On your first sign-in, you may keep your current username or change it once. "
+        "After this screen is completed, future username changes require Creator/Admin approval."
+    )
+    current=state["username"] or str(auth.get("username","")).strip()
+    st.write(f"Current username: **{current}**")
+
+    choice=st.radio(
+        "What would you like to do?",
+        ["Keep my current username","Change my username now"],
+        key="initial_username_choice"
+    )
+
+    if choice=="Change my username now":
+        proposed=st.text_input(
+            "Choose your new username",
+            value="",
+            placeholder="3–30 characters: letters, numbers, . _ -",
+            key="initial_new_username"
+        )
+        cleaned=_username_clean(proposed)
+        if proposed and not _username_valid(cleaned):
+            st.warning("Use 3–30 characters with no spaces. Letters, numbers, periods, underscores, and hyphens are allowed.")
+        if st.button("Save New Username",type="primary",use_container_width=True,key="save_initial_username"):
+            if not _username_valid(cleaned):
+                st.error("Enter a valid username first.")
+            else:
+                save_initial_username_choice(cleaned)
+                st.success(f"Username changed to {cleaned}.")
+                st.rerun()
+    else:
+        if st.button("Keep Current Username",type="primary",use_container_width=True,key="keep_initial_username"):
+            save_initial_username_choice(current)
+            st.success("Current username kept.")
+            st.rerun()
+
+    st.stop()
+
+enforce_initial_username_choice()
 
 # ---------- Helpers ----------
 def nm(row): return f"{row['first_name']} {row['last_name']}"
@@ -3678,6 +3895,32 @@ with st.container(border=True):
             st.rerun()
 
         st.markdown("---")
+        st.markdown("#### 🔑 Login Username")
+        user_state=auth_username_state()
+        st.caption(f"Current username: {user_state['username']}")
+        if user_state["initial_choice_used"]:
+            st.caption("Your one-time username choice has been used. Additional changes require Creator/Admin approval.")
+            requested_username=st.text_input(
+                "Request a new username",
+                placeholder="3–30 characters: letters, numbers, . _ -",
+                key="prof_username_request"
+            )
+            request_reason=st.text_area(
+                "Reason for change (optional)",
+                placeholder="Tell the Creator/Admin why you would like the username changed.",
+                height=75,key="prof_username_reason"
+            )
+            if st.button("Send Username Change Request",key="prof_send_username_request"):
+                cleaned=_username_clean(requested_username)
+                if not _username_valid(cleaned):
+                    st.error("Use 3–30 characters with no spaces. Letters, numbers, periods, underscores, and hyphens are allowed.")
+                elif cleaned==user_state["username"]:
+                    st.info("That is already your current username.")
+                else:
+                    submit_username_change_request(cleaned,request_reason)
+                    st.success("Username change request sent to Creator/Admin.")
+
+        st.markdown("---")
         st.markdown("#### Newsletter Role")
         current_lead=newsletter_is_lead()
         lead_choice=st.checkbox(
@@ -3736,6 +3979,35 @@ with st.container(border=True):
                 "Dean/SPED Dean/cross-program features remain hidden until you turn them on."
             )
 
+
+            st.markdown("---")
+            st.markdown("#### 🔑 Username Change Requests")
+            pending_names=pending_username_requests()
+            if pending_names.empty:
+                st.caption("No username change requests are waiting.")
+            else:
+                for _,ur in pending_names.iterrows():
+                    rid=int(ur["id"])
+                    with st.container(border=True):
+                        st.write(
+                            f"**{ur['requester_name'] or ur['requester_key']}** wants to change "
+                            f"`{ur['current_username']}` → `{ur['requested_username']}`"
+                        )
+                        if ur["reason"]:
+                            st.caption("Reason: "+str(ur["reason"]))
+                        review_note=st.text_input(
+                            "Review note (optional)",
+                            key=f"username_review_note_{rid}"
+                        )
+                        ua1,ua2=st.columns(2)
+                        if ua1.button("✅ Approve",key=f"approve_username_{rid}",use_container_width=True):
+                            review_username_request(rid,True,review_note)
+                            st.success("Username change approved.")
+                            st.rerun()
+                        if ua2.button("❌ Deny",key=f"deny_username_{rid}",use_container_width=True):
+                            review_username_request(rid,False,review_note)
+                            st.success("Username change denied.")
+                            st.rerun()
 
             st.markdown("---")
             st.markdown("#### 🎭 Demo Class")
@@ -5112,6 +5384,7 @@ elif page=="Book Leveler":
                                 detected,error=decode_isbn_barcode(camera_photo)
                             if detected:
                                 st.session_state["book_camera_isbn"]=detected
+                                st.session_state["book_camera_manual_correction"]=detected
                                 st.session_state["book_online_search_mode"]="ISBN"
                                 st.session_state["book_online_query"]=detected
                                 try:
@@ -5135,9 +5408,15 @@ elif page=="Book Leveler":
                         st.success(st.session_state["_book_scan_message"])
 
                     # Manual correction is still available if a damaged barcode cannot be decoded.
+                    # Keep the visible correction box synchronized with the detected ISBN.
+                    # Streamlit ignores `value=` after a keyed widget has already been created,
+                    # so update the widget's own session-state key before rendering it.
+                    detected_value=st.session_state.get("book_camera_isbn","")
+                    if detected_value and st.session_state.get("book_camera_manual_correction")!=detected_value:
+                        st.session_state["book_camera_manual_correction"]=detected_value
+
                     manual_cam=st.text_input(
                         "Detected ISBN / manual correction",
-                        value=st.session_state.get("book_camera_isbn",""),
                         placeholder="978...",
                         key="book_camera_manual_correction"
                     )
@@ -5147,6 +5426,7 @@ elif page=="Book Leveler":
                             st.warning("Enter a valid 10- or 13-digit ISBN.")
                         else:
                             st.session_state["book_camera_isbn"]=cleaned
+                            st.session_state["book_camera_manual_correction"]=cleaned
                             st.session_state["book_online_search_mode"]="ISBN"
                             st.session_state["book_online_query"]=cleaned
                             try:
@@ -5171,6 +5451,7 @@ elif page=="Book Leveler":
                         st.warning(error)
                     else:
                         st.session_state["book_camera_isbn"]=detected
+                        st.session_state["book_camera_manual_correction"]=detected
                         st.session_state["book_online_search_mode"]="ISBN"
                         st.session_state["book_online_query"]=detected
                         try:
