@@ -2495,8 +2495,12 @@ def decode_isbn_barcode(image_file):
         from PIL import Image, ImageEnhance, ImageOps, ImageFilter
         import numpy as np
 
-        raw=image_file.getvalue() if hasattr(image_file,"getvalue") else bytes(image_file.getbuffer())
-        img=Image.open(BytesIO(raw)).convert("RGB")
+        if hasattr(image_file,"convert") and hasattr(image_file,"size"):
+            # PIL.Image from rear-camera custom component.
+            img=image_file.convert("RGB")
+        else:
+            raw=image_file.getvalue() if hasattr(image_file,"getvalue") else bytes(image_file.getbuffer())
+            img=Image.open(BytesIO(raw)).convert("RGB")
         w,h=img.size
 
         # Camera previews can look soft even on a very good phone camera.
@@ -5345,96 +5349,127 @@ elif page=="Book Leveler":
         )
 
         if identify_mode=="Camera":
-            # Camera remains user-activated and does not open automatically.
-            if st.button("📷 Open ISBN Camera",key="toggle_book_camera"):
-                st.session_state["show_book_camera"]=not st.session_state.get("show_book_camera",False)
-                st.rerun()
+            st.markdown("#### 📷 Rear Camera Scanner")
+            st.info(
+                "On phones, ChapLab now requests the **rear/environment camera only** for book scanning. "
+                "There is no front-camera option in this scanner."
+            )
+            st.caption(
+                "Hold the phone about 8–14 inches from the book. Keep the entire ISBN barcode in the center. "
+                "The rear camera usually focuses better when you are not extremely close."
+            )
 
-            if st.session_state.get("show_book_camera",False):
-                with st.container(border=True):
-                    cam_top1,cam_top2=st.columns([5,1])
-                    cam_top1.markdown("#### 📷 Scan Book Barcode")
-                    if cam_top2.button("✕ Close",key="close_book_camera"):
-                        st.session_state["show_book_camera"]=False
-                        st.rerun()
+            # Lazy import so a community camera component can never block ChapLab startup.
+            rear_component=None
+            rear_component_error=None
+            try:
+                from streamlit_back_camera_input import back_camera_input
+                rear_component=back_camera_input
+            except Exception as e:
+                rear_component_error=str(e)
 
-                    st.info(
-                        "📚 **Scanner Mode:** Put the entire ISBN barcode near the CENTER of the picture. "
-                        "If the bars look blurry, move the phone slightly farther away until they become sharp. "
-                        "Avoid glare and hold still when you capture."
+            rear_photo=None
+            if rear_component is not None:
+                try:
+                    st.caption("Tap the rear-camera preview to capture the barcode.")
+                    rear_photo=rear_component()
+                except Exception as e:
+                    rear_component_error=str(e)
+                    rear_photo=None
+
+            if rear_photo is None and rear_component_error:
+                st.warning(
+                    "Rear-camera-only component could not start in this browser. "
+                    "Using ChapLab's high-resolution camera fallback instead."
+                )
+                # Streamlit 1.62 supports requested capture resolution.
+                # This fallback may still expose the browser's camera switch control.
+                rear_photo=st.camera_input(
+                    "Capture ISBN barcode",
+                    key="book_isbn_camera_capture_fallback",
+                    resolution="1080p",
+                    width="stretch"
+                )
+
+            if rear_photo is not None:
+                with st.expander("🔍 Check captured barcode",expanded=False):
+                    st.image(
+                        rear_photo,
+                        caption="Captured image — the complete barcode should look sharp here.",
+                        use_container_width=True
                     )
                     st.caption(
-                        "After capture, ChapLab automatically crops the barcode area, enlarges it, sharpens it, "
-                        "increases contrast, checks rotated versions, and tries several scans before asking you to rescan."
-                    )
-                    camera_photo=st.camera_input(
-                        "Capture ISBN barcode",
-                        key="book_isbn_camera_capture"
+                        "If the black barcode lines blend together, move the phone slightly farther away and capture again."
                     )
 
-                    if camera_photo is not None:
-                        with st.expander("🔍 Check captured barcode",expanded=False):
-                            st.image(camera_photo,caption="Captured image — the complete barcode should look sharp here.",use_container_width=True)
-                            st.caption("If the black barcode lines are smeared together, capture it again from slightly farther away.")
-                        scan_token=(camera_photo.name if getattr(camera_photo,"name",None) else "camera",
-                                    len(camera_photo.getvalue()))
-                        if st.session_state.get("_last_camera_scan_token")!=scan_token:
-                            st.session_state["_last_camera_scan_token"]=scan_token
-                            with st.spinner("Reading ISBN barcode..."):
-                                detected,error=decode_isbn_barcode(camera_photo)
-                            if detected:
-                                st.session_state["book_camera_isbn"]=detected
-                                st.session_state["book_camera_manual_correction"]=detected
-                                st.session_state["book_online_search_mode"]="ISBN"
-                                st.session_state["book_online_query"]=detected
-                                try:
-                                    found=openlibrary_lookup_isbn(detected)
-                                    st.session_state["book_online_results"]=[found] if found else []
-                                    st.session_state["_book_scan_message"]=(
-                                        f"✅ ISBN **{detected}** detected and book information loaded."
-                                        if found else
-                                        f"✅ ISBN **{detected}** detected. No Open Library match was found, but the ISBN has been populated."
-                                    )
-                                except Exception as e:
-                                    st.session_state["book_online_results"]=[]
-                                    st.session_state["_book_scan_message"]=f"✅ ISBN **{detected}** detected. Lookup error: {e}"
-                                st.rerun()
-                            else:
-                                st.session_state["_book_scan_error"]=error
+                # Create a stable-enough token without assuming UploadedFile.
+                try:
+                    if hasattr(rear_photo,"getvalue"):
+                        token_size=len(rear_photo.getvalue())
+                    elif hasattr(rear_photo,"size") and isinstance(rear_photo.size,tuple):
+                        token_size=rear_photo.size
+                    else:
+                        token_size=str(type(rear_photo))
+                except Exception:
+                    token_size=str(type(rear_photo))
+                scan_token=("rear-camera",str(token_size))
 
-                    if st.session_state.get("_book_scan_error"):
-                        st.warning(st.session_state.pop("_book_scan_error"))
-                    if st.session_state.get("_book_scan_message"):
-                        st.success(st.session_state["_book_scan_message"])
+                if st.session_state.get("_last_camera_scan_token")!=scan_token:
+                    st.session_state["_last_camera_scan_token"]=scan_token
+                    with st.spinner("Reading ISBN barcode..."):
+                        detected,error=decode_isbn_barcode(rear_photo)
 
-                    # Manual correction is still available if a damaged barcode cannot be decoded.
-                    # Keep the visible correction box synchronized with the detected ISBN.
-                    # Streamlit ignores `value=` after a keyed widget has already been created,
-                    # so update the widget's own session-state key before rendering it.
-                    detected_value=st.session_state.get("book_camera_isbn","")
-                    if detected_value and st.session_state.get("book_camera_manual_correction")!=detected_value:
-                        st.session_state["book_camera_manual_correction"]=detected_value
+                    if detected:
+                        st.session_state["book_camera_isbn"]=detected
+                        st.session_state["book_camera_manual_correction"]=detected
+                        st.session_state["book_online_search_mode"]="ISBN"
+                        st.session_state["book_online_query"]=detected
+                        try:
+                            found=openlibrary_lookup_isbn(detected)
+                            st.session_state["book_online_results"]=[found] if found else []
+                            st.session_state["_book_scan_message"]=(
+                                f"✅ ISBN **{detected}** detected and book information loaded."
+                                if found else
+                                f"✅ ISBN **{detected}** detected. No Open Library match was found, but the ISBN has been populated."
+                            )
+                        except Exception as e:
+                            st.session_state["book_online_results"]=[]
+                            st.session_state["_book_scan_message"]=f"✅ ISBN **{detected}** detected. Lookup error: {e}"
+                        st.rerun()
+                    else:
+                        st.session_state["_book_scan_error"]=error
+                        st.rerun()
 
-                    manual_cam=st.text_input(
-                        "Detected ISBN / manual correction",
-                        placeholder="978...",
-                        key="book_camera_manual_correction"
-                    )
-                    if st.button("Use This ISBN",key="use_camera_manual_isbn"):
-                        cleaned=re.sub(r"[^0-9Xx]","",manual_cam or "")
-                        if len(cleaned) not in (10,13):
-                            st.warning("Enter a valid 10- or 13-digit ISBN.")
-                        else:
-                            st.session_state["book_camera_isbn"]=cleaned
-                            st.session_state["book_camera_manual_correction"]=cleaned
-                            st.session_state["book_online_search_mode"]="ISBN"
-                            st.session_state["book_online_query"]=cleaned
-                            try:
-                                found=openlibrary_lookup_isbn(cleaned)
-                                st.session_state["book_online_results"]=[found] if found else []
-                            except Exception as e:
-                                st.error(str(e))
-                            st.rerun()
+            if st.session_state.get("_book_scan_error"):
+                st.warning(st.session_state.pop("_book_scan_error"))
+            if st.session_state.get("_book_scan_message"):
+                st.success(st.session_state["_book_scan_message"])
+
+            # Manual correction remains available and auto-fills after a successful scan.
+            detected_value=st.session_state.get("book_camera_isbn","")
+            if detected_value and st.session_state.get("book_camera_manual_correction")!=detected_value:
+                st.session_state["book_camera_manual_correction"]=detected_value
+
+            manual_cam=st.text_input(
+                "Detected ISBN / manual correction",
+                placeholder="978...",
+                key="book_camera_manual_correction"
+            )
+            if st.button("Use This ISBN",key="use_camera_manual_isbn"):
+                cleaned=re.sub(r"[^0-9Xx]","",manual_cam or "")
+                if len(cleaned) not in (10,13):
+                    st.warning("Enter a valid 10- or 13-digit ISBN.")
+                else:
+                    st.session_state["book_camera_isbn"]=cleaned
+                    st.session_state["book_camera_manual_correction"]=cleaned
+                    st.session_state["book_online_search_mode"]="ISBN"
+                    st.session_state["book_online_query"]=cleaned
+                    try:
+                        found=openlibrary_lookup_isbn(cleaned)
+                        st.session_state["book_online_results"]=[found] if found else []
+                    except Exception as e:
+                        st.error(str(e))
+                    st.rerun()
 
         elif identify_mode=="Upload Barcode Photo":
             barcode_upload=st.file_uploader(
