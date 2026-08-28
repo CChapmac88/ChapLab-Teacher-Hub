@@ -128,6 +128,239 @@ def auth_config():
 def cloud_configured():
     return cloud_config() is not None
 
+# ---------- Staff Account Security / Activity ----------
+def valid_school_staff_email(email):
+    """Only school staff emails beginning with 79. and ending @nhaschools.com are eligible."""
+    email=str(email or "").strip().lower()
+    return bool(re.fullmatch(r"79\.[a-z0-9._%+\-]+@nhaschools\.com",email))
+
+def ensure_staff_account_columns():
+    c=conn()
+    cols={r["name"] for r in c.execute("PRAGMA table_info(staff_accounts)").fetchall()}
+    migrations={
+        "last_login":"TEXT DEFAULT ''",
+        "last_seen":"TEXT DEFAULT ''",
+        "login_count":"INTEGER DEFAULT 0",
+        "deactivated_at":"TEXT DEFAULT ''",
+        "deactivated_by":"TEXT DEFAULT ''",
+        "deactivation_reason":"TEXT DEFAULT ''",
+        "password_hash":"TEXT DEFAULT ''",
+        "password_salt":"TEXT DEFAULT ''",
+        "password_set_at":"TEXT DEFAULT ''",
+        "password_setup_required":"INTEGER DEFAULT 1",
+        "password_reset_at":"TEXT DEFAULT ''",
+        "password_reset_by":"TEXT DEFAULT ''",
+    }
+    for name,definition in migrations.items():
+        if name not in cols:
+            c.execute(f"ALTER TABLE staff_accounts ADD COLUMN {name} {definition}")
+    c.commit(); c.close()
+
+def staff_account_by_email(email):
+    email=str(email or "").strip().lower()
+    c=conn()
+    r=c.execute(
+        "SELECT * FROM staff_accounts WHERE lower(email)=lower(?) LIMIT 1",
+        (email,)
+    ).fetchone()
+    c.close()
+    return r
+
+def staff_account_can_login(email):
+    email=str(email or "").strip().lower()
+    if not valid_school_staff_email(email):
+        return False,"School staff email must start with 79. and end with @nhaschools.com."
+    r=staff_account_by_email(email)
+    if not r:
+        return False,"This staff email is not registered in ChapLab yet."
+    if str(r["approval_status"] or "").strip()!="Approved":
+        return False,"This account is waiting for approval."
+    if not bool(r["active"]):
+        return False,"This ChapLab account has been deactivated."
+    return True,""
+
+def record_staff_login(email):
+    email=str(email or "").strip().lower()
+    if not email:
+        return
+    now=datetime.now().isoformat(timespec="seconds")
+    c=conn()
+    c.execute(
+        """UPDATE staff_accounts
+           SET last_login=?,last_seen=?,login_count=COALESCE(login_count,0)+1
+           WHERE lower(email)=lower(?)""",
+        (now,now,email)
+    )
+    c.execute(
+        """INSERT INTO staff_login_activity(staff_email,logged_in_at,event_type,details)
+           VALUES (?,?,?,?)""",
+        (email,now,"Login","Successful ChapLab sign-in")
+    )
+    c.commit(); c.close()
+
+def touch_staff_last_seen(email):
+    email=str(email or "").strip().lower()
+    if not email:
+        return
+    c=conn()
+    c.execute(
+        "UPDATE staff_accounts SET last_seen=? WHERE lower(email)=lower(?)",
+        (datetime.now().isoformat(timespec="seconds"),email)
+    )
+    c.commit(); c.close()
+
+def all_staff_accounts_df():
+    c=conn()
+    df=pd.read_sql_query(
+        """SELECT id,email,display_name,role_type,grade_band,subjects,
+                  approval_status,active,created_at,approved_at,approved_by,
+                  COALESCE(last_login,'') last_login,
+                  COALESCE(last_seen,'') last_seen,
+                  COALESCE(login_count,0) login_count,
+                  COALESCE(deactivated_at,'') deactivated_at,
+                  COALESCE(deactivated_by,'') deactivated_by,
+                  COALESCE(deactivation_reason,'') deactivation_reason,
+                  COALESCE(password_set_at,'') password_set_at,
+                  COALESCE(password_setup_required,1) password_setup_required,
+                  COALESCE(password_reset_at,'') password_reset_at
+           FROM staff_accounts
+           ORDER BY active DESC,approval_status,display_name,email""",
+        c
+    )
+    c.close()
+    return df
+
+def set_staff_account_active(email,active,reason=""):
+    email=str(email or "").strip().lower()
+    c=conn()
+    if active:
+        c.execute(
+            """UPDATE staff_accounts
+               SET active=1,deactivated_at='',deactivated_by='',deactivation_reason=''
+               WHERE lower(email)=lower(?)""",
+            (email,)
+        )
+    else:
+        now=datetime.now().isoformat(timespec="seconds")
+        c.execute(
+            """UPDATE staff_accounts
+               SET active=0,deactivated_at=?,deactivated_by=?,deactivation_reason=?
+               WHERE lower(email)=lower(?)""",
+            (now,"ChapLab App Creator & Administrator",str(reason or "").strip(),email)
+        )
+        c.execute(
+            """INSERT INTO staff_login_activity(staff_email,logged_in_at,event_type,details)
+               VALUES (?,?,?,?)""",
+            (email,now,"Deactivated",str(reason or "").strip())
+        )
+    c.commit(); c.close()
+
+def set_staff_approval(email,status):
+    email=str(email or "").strip().lower()
+    if status=="Approved" and not valid_school_staff_email(email):
+        return False
+    now=datetime.now().isoformat(timespec="seconds")
+    c=conn()
+    c.execute(
+        """UPDATE staff_accounts SET approval_status=?,
+           approved_at=CASE WHEN ?='Approved' THEN ? ELSE approved_at END,
+           approved_by=CASE WHEN ?='Approved' THEN 'ChapLab App Creator & Administrator' ELSE approved_by END
+           WHERE lower(email)=lower(?)""",
+        (status,status,now,status,email)
+    )
+    c.commit(); c.close()
+    return True
+
+INITIAL_STAFF_ACCESS_CODE="bscs"
+
+def _password_hash(password,salt_hex=None):
+    """
+    PBKDF2-HMAC-SHA256 password hashing using stdlib only.
+    Returns (salt_hex, digest_hex).
+    """
+    password=str(password or "")
+    if salt_hex:
+        salt=bytes.fromhex(salt_hex)
+    else:
+        salt=secrets.token_bytes(16)
+        salt_hex=salt.hex()
+    digest=hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        240000
+    )
+    return salt_hex,digest.hex()
+
+def staff_password_is_set(account):
+    if not account:
+        return False
+    try:
+        return bool(str(account["password_hash"] or "").strip()) and not bool(account["password_setup_required"])
+    except Exception:
+        return False
+
+def verify_staff_password(account,password):
+    if not account or not staff_password_is_set(account):
+        return False
+    try:
+        salt=str(account["password_salt"] or "")
+        expected=str(account["password_hash"] or "")
+        _,actual=_password_hash(str(password or ""),salt)
+        return hmac.compare_digest(actual,expected)
+    except Exception:
+        return False
+
+def set_staff_password(email,new_password):
+    email=str(email or "").strip().lower()
+    salt,digest=_password_hash(new_password)
+    now=datetime.now().isoformat(timespec="seconds")
+    c=conn()
+    c.execute(
+        """UPDATE staff_accounts
+           SET password_hash=?,password_salt=?,password_set_at=?,
+               password_setup_required=0,password_reset_at='',password_reset_by=''
+           WHERE lower(email)=lower(?)""",
+        (digest,salt,now,email)
+    )
+    c.commit(); c.close()
+
+def reset_staff_password_setup(email):
+    """
+    Creator reset: removes the staff password and returns the account to the
+    one-time access-code setup flow.
+    """
+    email=str(email or "").strip().lower()
+    now=datetime.now().isoformat(timespec="seconds")
+    c=conn()
+    c.execute(
+        """UPDATE staff_accounts
+           SET password_hash='',password_salt='',password_set_at='',
+               password_setup_required=1,password_reset_at=?,
+               password_reset_by='ChapLab App Creator & Administrator'
+           WHERE lower(email)=lower(?)""",
+        (now,email)
+    )
+    c.execute(
+        """INSERT INTO staff_login_activity(staff_email,logged_in_at,event_type,details)
+           VALUES (?,?,?,?)""",
+        (email,now,"Password Reset","Returned to initial access-code setup")
+    )
+    c.commit(); c.close()
+
+def staff_needs_password_setup(email):
+    r=staff_account_by_email(email)
+    if not r:
+        return False
+    try:
+        return bool(r["password_setup_required"]) or not bool(str(r["password_hash"] or "").strip())
+    except Exception:
+        return True
+
+def initial_access_code_matches(value):
+    return str(value or "").strip().lower()==INITIAL_STAFF_ACCESS_CODE
+
+
 def require_login():
     auth=auth_config()
     if cloud_configured() and not auth:
@@ -203,7 +436,7 @@ def require_login():
     )
 
     with st.form("chaplab_login"):
-        username=st.text_input("School email / Creator username")
+        username=st.text_input("School email/username")
         password=st.text_input("Password / Initial access code",type="password")
         submitted=st.form_submit_button("Sign In",use_container_width=True)
 
@@ -1101,239 +1334,8 @@ def seed():
 
 init_db(); seed()
 
-# ---------- Staff Account Security / Activity ----------
-def valid_school_staff_email(email):
-    """Only school staff emails beginning with 79. and ending @nhaschools.com are eligible."""
-    email=str(email or "").strip().lower()
-    return bool(re.fullmatch(r"79\.[a-z0-9._%+\-]+@nhaschools\.com",email))
-
-def ensure_staff_account_columns():
-    c=conn()
-    cols={r["name"] for r in c.execute("PRAGMA table_info(staff_accounts)").fetchall()}
-    migrations={
-        "last_login":"TEXT DEFAULT ''",
-        "last_seen":"TEXT DEFAULT ''",
-        "login_count":"INTEGER DEFAULT 0",
-        "deactivated_at":"TEXT DEFAULT ''",
-        "deactivated_by":"TEXT DEFAULT ''",
-        "deactivation_reason":"TEXT DEFAULT ''",
-        "password_hash":"TEXT DEFAULT ''",
-        "password_salt":"TEXT DEFAULT ''",
-        "password_set_at":"TEXT DEFAULT ''",
-        "password_setup_required":"INTEGER DEFAULT 1",
-        "password_reset_at":"TEXT DEFAULT ''",
-        "password_reset_by":"TEXT DEFAULT ''",
-    }
-    for name,definition in migrations.items():
-        if name not in cols:
-            c.execute(f"ALTER TABLE staff_accounts ADD COLUMN {name} {definition}")
-    c.commit(); c.close()
-
-def staff_account_by_email(email):
-    email=str(email or "").strip().lower()
-    c=conn()
-    r=c.execute(
-        "SELECT * FROM staff_accounts WHERE lower(email)=lower(?) LIMIT 1",
-        (email,)
-    ).fetchone()
-    c.close()
-    return r
-
-def staff_account_can_login(email):
-    email=str(email or "").strip().lower()
-    if not valid_school_staff_email(email):
-        return False,"School staff email must start with 79. and end with @nhaschools.com."
-    r=staff_account_by_email(email)
-    if not r:
-        return False,"This staff email is not registered in ChapLab yet."
-    if str(r["approval_status"] or "").strip()!="Approved":
-        return False,"This account is waiting for approval."
-    if not bool(r["active"]):
-        return False,"This ChapLab account has been deactivated."
-    return True,""
-
-def record_staff_login(email):
-    email=str(email or "").strip().lower()
-    if not email:
-        return
-    now=datetime.now().isoformat(timespec="seconds")
-    c=conn()
-    c.execute(
-        """UPDATE staff_accounts
-           SET last_login=?,last_seen=?,login_count=COALESCE(login_count,0)+1
-           WHERE lower(email)=lower(?)""",
-        (now,now,email)
-    )
-    c.execute(
-        """INSERT INTO staff_login_activity(staff_email,logged_in_at,event_type,details)
-           VALUES (?,?,?,?)""",
-        (email,now,"Login","Successful ChapLab sign-in")
-    )
-    c.commit(); c.close()
-
-def touch_staff_last_seen(email):
-    email=str(email or "").strip().lower()
-    if not email:
-        return
-    c=conn()
-    c.execute(
-        "UPDATE staff_accounts SET last_seen=? WHERE lower(email)=lower(?)",
-        (datetime.now().isoformat(timespec="seconds"),email)
-    )
-    c.commit(); c.close()
-
-def all_staff_accounts_df():
-    c=conn()
-    df=pd.read_sql_query(
-        """SELECT id,email,display_name,role_type,grade_band,subjects,
-                  approval_status,active,created_at,approved_at,approved_by,
-                  COALESCE(last_login,'') last_login,
-                  COALESCE(last_seen,'') last_seen,
-                  COALESCE(login_count,0) login_count,
-                  COALESCE(deactivated_at,'') deactivated_at,
-                  COALESCE(deactivated_by,'') deactivated_by,
-                  COALESCE(deactivation_reason,'') deactivation_reason,
-                  COALESCE(password_set_at,'') password_set_at,
-                  COALESCE(password_setup_required,1) password_setup_required,
-                  COALESCE(password_reset_at,'') password_reset_at
-           FROM staff_accounts
-           ORDER BY active DESC,approval_status,display_name,email""",
-        c
-    )
-    c.close()
-    return df
-
-def set_staff_account_active(email,active,reason=""):
-    email=str(email or "").strip().lower()
-    c=conn()
-    if active:
-        c.execute(
-            """UPDATE staff_accounts
-               SET active=1,deactivated_at='',deactivated_by='',deactivation_reason=''
-               WHERE lower(email)=lower(?)""",
-            (email,)
-        )
-    else:
-        now=datetime.now().isoformat(timespec="seconds")
-        c.execute(
-            """UPDATE staff_accounts
-               SET active=0,deactivated_at=?,deactivated_by=?,deactivation_reason=?
-               WHERE lower(email)=lower(?)""",
-            (now,"ChapLab App Creator & Administrator",str(reason or "").strip(),email)
-        )
-        c.execute(
-            """INSERT INTO staff_login_activity(staff_email,logged_in_at,event_type,details)
-               VALUES (?,?,?,?)""",
-            (email,now,"Deactivated",str(reason or "").strip())
-        )
-    c.commit(); c.close()
-
-def set_staff_approval(email,status):
-    email=str(email or "").strip().lower()
-    if status=="Approved" and not valid_school_staff_email(email):
-        return False
-    now=datetime.now().isoformat(timespec="seconds")
-    c=conn()
-    c.execute(
-        """UPDATE staff_accounts SET approval_status=?,
-           approved_at=CASE WHEN ?='Approved' THEN ? ELSE approved_at END,
-           approved_by=CASE WHEN ?='Approved' THEN 'ChapLab App Creator & Administrator' ELSE approved_by END
-           WHERE lower(email)=lower(?)""",
-        (status,status,now,status,email)
-    )
-    c.commit(); c.close()
-    return True
-
+# Ensure staff account login/password/activity columns exist before pilot seeding.
 ensure_staff_account_columns()
-
-INITIAL_STAFF_ACCESS_CODE="bscs"
-
-def _password_hash(password,salt_hex=None):
-    """
-    PBKDF2-HMAC-SHA256 password hashing using stdlib only.
-    Returns (salt_hex, digest_hex).
-    """
-    password=str(password or "")
-    if salt_hex:
-        salt=bytes.fromhex(salt_hex)
-    else:
-        salt=secrets.token_bytes(16)
-        salt_hex=salt.hex()
-    digest=hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        salt,
-        240000
-    )
-    return salt_hex,digest.hex()
-
-def staff_password_is_set(account):
-    if not account:
-        return False
-    try:
-        return bool(str(account["password_hash"] or "").strip()) and not bool(account["password_setup_required"])
-    except Exception:
-        return False
-
-def verify_staff_password(account,password):
-    if not account or not staff_password_is_set(account):
-        return False
-    try:
-        salt=str(account["password_salt"] or "")
-        expected=str(account["password_hash"] or "")
-        _,actual=_password_hash(str(password or ""),salt)
-        return hmac.compare_digest(actual,expected)
-    except Exception:
-        return False
-
-def set_staff_password(email,new_password):
-    email=str(email or "").strip().lower()
-    salt,digest=_password_hash(new_password)
-    now=datetime.now().isoformat(timespec="seconds")
-    c=conn()
-    c.execute(
-        """UPDATE staff_accounts
-           SET password_hash=?,password_salt=?,password_set_at=?,
-               password_setup_required=0,password_reset_at='',password_reset_by=''
-           WHERE lower(email)=lower(?)""",
-        (digest,salt,now,email)
-    )
-    c.commit(); c.close()
-
-def reset_staff_password_setup(email):
-    """
-    Creator reset: removes the staff password and returns the account to the
-    one-time access-code setup flow.
-    """
-    email=str(email or "").strip().lower()
-    now=datetime.now().isoformat(timespec="seconds")
-    c=conn()
-    c.execute(
-        """UPDATE staff_accounts
-           SET password_hash='',password_salt='',password_set_at='',
-               password_setup_required=1,password_reset_at=?,
-               password_reset_by='ChapLab App Creator & Administrator'
-           WHERE lower(email)=lower(?)""",
-        (now,email)
-    )
-    c.execute(
-        """INSERT INTO staff_login_activity(staff_email,logged_in_at,event_type,details)
-           VALUES (?,?,?,?)""",
-        (email,now,"Password Reset","Returned to initial access-code setup")
-    )
-    c.commit(); c.close()
-
-def staff_needs_password_setup(email):
-    r=staff_account_by_email(email)
-    if not r:
-        return False
-    try:
-        return bool(r["password_setup_required"]) or not bool(str(r["password_hash"] or "").strip())
-    except Exception:
-        return True
-
-def initial_access_code_matches(value):
-    return str(value or "").strip().lower()==INITIAL_STAFF_ACCESS_CODE
 
 # ---------- Initial Grade 3 Pilot Team ----------
 GRADE3_PILOT_TEACHERS=[
