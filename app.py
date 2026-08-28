@@ -8758,3 +8758,134 @@ div[role="dialog"] label{
 """,unsafe_allow_html=True)
 
 
+# ---------- ChapLab v4.0.46 — Chalkboard Contrast Fix ----------
+st.markdown("""
+<style>
+/* General text on the dark board */
+.stApp p,
+.stApp span,
+.stApp div,
+.stApp label,
+.stApp small{
+  color:inherit;
+}
+
+/* Widget labels and helper text */
+[data-testid="stWidgetLabel"],
+[data-testid="stWidgetLabel"] *,
+[data-testid="stCaptionContainer"],
+[data-testid="stCaptionContainer"] *,
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] li{
+  color:var(--chalk-muted) !important;
+}
+
+/* Stronger contrast for ordinary section labels */
+[data-testid="stMarkdownContainer"] strong,
+[data-testid="stMarkdownContainer"] b{
+  color:var(--chalk) !important;
+}
+
+/* Radio labels */
+div[role="radiogroup"] label,
+div[role="radiogroup"] label *,
+[data-baseweb="radio"] label,
+[data-baseweb="radio"] label *{
+  color:var(--chalk) !important;
+  opacity:1 !important;
+}
+
+/* Checkbox / toggle labels */
+[data-testid="stCheckbox"] label,
+[data-testid="stCheckbox"] label *,
+[data-testid="stToggle"] label,
+[data-testid="stToggle"] label *{
+  color:var(--chalk) !important;
+  opacity:1 !important;
+}
+
+/* Selectbox / multiselect labels */
+[data-testid="stSelectbox"] label,
+[data-testid="stSelectbox"] label *,
+[data-testid="stMultiSelect"] label,
+[data-testid="stMultiSelect"] label *{
+  color:var(--chalk) !important;
+}
+
+/* Tabs */
+button[data-baseweb="tab"],
+button[data-baseweb="tab"] *{
+  color:var(--chalk-muted) !important;
+  opacity:1 !important;
+}
+button[data-baseweb="tab"][aria-selected="true"],
+button[data-baseweb="tab"][aria-selected="true"] *{
+  color:var(--chalk-yellow) !important;
+}
+
+/* Expander summary labels */
+details summary,
+details summary *,
+[data-testid="stExpander"] summary,
+[data-testid="stExpander"] summary *{
+  color:var(--chalk) !important;
+}
+
+/* Metrics */
+[data-testid="stMetricLabel"],
+[data-testid="stMetricLabel"] *,
+[data-testid="stMetricValue"],
+[data-testid="stMetricValue"] *{
+  color:var(--chalk) !important;
+}
+
+/* Info text and muted instructional copy */
+.page-subtitle,
+.teacher-hub-banner-details,
+.class-bar-label{
+  color:var(--chalk-muted) !important;
+}
+
+/* Keep editable controls dark-text on light paper */
+input,
+textarea,
+[data-baseweb="select"] > div,
+[data-baseweb="select"] span,
+[data-baseweb="input"] input,
+[data-testid="stTextInput"] input,
+[data-testid="stTextArea"] textarea,
+[data-testid="stNumberInput"] input{
+  color:var(--ink) !important;
+}
+[data-baseweb="select"] svg{
+  color:var(--ink) !important;
+}
+
+/* Radio/checkbox native text that old CSS made nearly black */
+.stRadio,
+.stCheckbox,
+.stToggle{
+  color:var(--chalk) !important;
+}
+
+/* Gradebook horizontal option row specifically */
+.stRadio [data-baseweb="radio"] > div:last-child,
+.stRadio [data-baseweb="radio"] span{
+  color:var(--chalk) !important;
+}
+
+/* Disabled-looking legacy text should remain readable unless truly disabled */
+:not([aria-disabled="true"]) > label,
+:not([aria-disabled="true"]) > span{
+  opacity:1;
+}
+
+/* Real disabled widgets stay visibly disabled, but still readable */
+[aria-disabled="true"],
+[aria-disabled="true"] *{
+  color:#9fb0a9 !important;
+  opacity:.8 !important;
+}
+</style>
+""",unsafe_allow_html=True)
+
