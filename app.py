@@ -8500,3 +8500,261 @@ section[data-testid="stSidebar"],[data-testid="collapsedControl"]{display:none!i
 </style>
 """,unsafe_allow_html=True)
 
+
+# ---------- ChapLab v4.0.45 — Chalkboard Visual Theme ----------
+st.markdown("""
+<style>
+:root{
+  --chalkboard:#173f35;
+  --chalkboard-deep:#102f28;
+  --chalkboard-soft:#235548;
+  --chalk:#f5f1df;
+  --chalk-muted:#d8dece;
+  --chalk-yellow:#f4dda0;
+  --chalk-blue:#b9ddef;
+  --chalk-pink:#efc1ca;
+  --chalk-green:#c9e0a1;
+  --wood:#8b5d3b;
+  --wood-dark:#65422d;
+  --paper:#fbf7e9;
+  --ink:#24322e;
+}
+
+/* Overall classroom chalkboard */
+.stApp,
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"]{
+  background:
+    radial-gradient(circle at 18% 22%,rgba(255,255,255,.025),transparent 22%),
+    radial-gradient(circle at 72% 63%,rgba(255,255,255,.02),transparent 18%),
+    linear-gradient(135deg,var(--chalkboard-deep),var(--chalkboard) 48%,#1b473b) !important;
+  color:var(--chalk) !important;
+}
+header[data-testid="stHeader"]{
+  background:rgba(16,47,40,.94) !important;
+  border-bottom:4px solid var(--wood) !important;
+}
+.block-container,
+[data-testid="stMain"] .block-container{
+  max-width:1500px !important;
+  width:100% !important;
+  margin:0 auto !important;
+  padding:32px 30px 70px !important;
+  background:transparent !important;
+}
+
+/* Give the main workspace a framed-board feel */
+[data-testid="stMainBlockContainer"]{
+  border-left:8px solid var(--wood-dark);
+  border-right:8px solid var(--wood-dark);
+  box-shadow:inset 0 0 45px rgba(0,0,0,.18);
+}
+
+/* Chalk-like headings */
+.page-title,
+.teacher-hub-banner-title,
+.hero-card h1,
+h1,h2,h3{
+  font-family:"Comic Sans MS","Segoe Print","Bradley Hand",cursive !important;
+  color:var(--chalk) !important;
+  text-shadow:0 1px 0 rgba(255,255,255,.08);
+}
+.page-title{
+  font-size:36px !important;
+  letter-spacing:.4px;
+}
+.page-subtitle,
+.teacher-hub-banner-details,
+[data-testid="stCaptionContainer"],
+.stCaptionContainer,
+small{
+  color:var(--chalk-muted) !important;
+}
+
+/* Teacher Hub / hero board */
+.hero-card,
+.teacher-hub-banner{
+  background:
+    linear-gradient(rgba(23,63,53,.96),rgba(23,63,53,.96)),
+    repeating-linear-gradient(0deg,transparent 0 29px,rgba(255,255,255,.025) 30px) !important;
+  border:2px solid rgba(245,241,223,.38) !important;
+  border-radius:10px !important;
+  box-shadow:
+    0 0 0 7px var(--wood),
+    0 0 0 9px var(--wood-dark),
+    0 10px 25px rgba(0,0,0,.25) !important;
+  color:var(--chalk) !important;
+}
+.hero-card:after{
+  color:var(--chalk-yellow) !important;
+  opacity:.85;
+}
+.hero-card .accent,
+.accent-page-label{
+  background:transparent !important;
+  color:var(--chalk-yellow) !important;
+  border:1px dashed rgba(244,221,160,.75) !important;
+  border-radius:6px !important;
+}
+
+/* Navigation: chalk labels rather than app-like white tiles */
+div[data-testid="stHorizontalBlock"] [data-testid="stButton"] button{
+  border-radius:8px !important;
+}
+[data-testid="stButton"] button{
+  background:rgba(255,255,255,.035) !important;
+  color:var(--chalk) !important;
+  border:1px solid rgba(245,241,223,.38) !important;
+  box-shadow:none !important;
+}
+[data-testid="stButton"] button:hover{
+  background:rgba(245,241,223,.10) !important;
+  border-color:var(--chalk-yellow) !important;
+  color:#fffdf5 !important;
+}
+[data-testid="stButton"] button[kind="primary"]{
+  background:rgba(244,221,160,.16) !important;
+  color:var(--chalk-yellow) !important;
+  border:2px solid var(--chalk-yellow) !important;
+}
+[data-testid="stButton"] button *{
+  color:inherit !important;
+}
+
+/* Tabs resemble chalk labels */
+button[data-baseweb="tab"]{
+  color:var(--chalk-muted) !important;
+  font-weight:800 !important;
+}
+button[data-baseweb="tab"][aria-selected="true"]{
+  color:var(--chalk-yellow) !important;
+  border-bottom-color:var(--chalk-yellow) !important;
+}
+[data-baseweb="tab-highlight"]{
+  background-color:var(--chalk-yellow) !important;
+}
+
+/* Inputs stay light for comfortable data entry */
+input,
+textarea,
+[data-baseweb="select"] > div,
+[data-testid="stNumberInput"] input,
+[data-testid="stTextInput"] input,
+[data-testid="stTextArea"] textarea{
+  background:var(--paper) !important;
+  color:var(--ink) !important;
+  border-color:#d7ccb5 !important;
+}
+input::placeholder,
+textarea::placeholder{
+  color:#7c827c !important;
+}
+label,
+[data-testid="stWidgetLabel"] p{
+  color:var(--chalk) !important;
+}
+
+/* Containers look like chalk-board panels */
+div[data-testid="stForm"],
+div[data-testid="stExpander"],
+div[data-testid="stMetric"],
+[data-testid="stVerticalBlockBorderWrapper"]{
+  background:rgba(10,38,31,.42) !important;
+  border:1px solid rgba(245,241,223,.28) !important;
+  border-radius:10px !important;
+  box-shadow:0 4px 12px rgba(0,0,0,.13) !important;
+}
+div[data-testid="stMetric"] label,
+div[data-testid="stMetric"] [data-testid="stMetricValue"]{
+  color:var(--chalk) !important;
+}
+
+/* Dataframes get a warm paper surround for readability */
+div[data-testid="stDataFrame"]{
+  background:var(--paper) !important;
+  border:5px solid var(--wood-dark) !important;
+  border-radius:8px !important;
+  overflow:hidden !important;
+}
+
+/* Info/status messages: classroom note cards */
+[data-testid="stAlert"]{
+  border-radius:8px !important;
+  border-left-width:6px !important;
+  box-shadow:0 3px 9px rgba(0,0,0,.14);
+}
+
+/* Dashboard sticky notes remain colorful, now sitting on the board */
+.sticky-card{
+  color:#27312e !important;
+  border-radius:3px !important;
+  box-shadow:5px 7px 10px rgba(0,0,0,.24) !important;
+  transform:rotate(-.35deg);
+}
+.sticky-card:nth-child(even){transform:rotate(.45deg)}
+.s-pink{background:#efc1ca !important}
+.s-orange{background:#efc18b !important}
+.s-yellow{background:#f4dda0 !important}
+.s-green{background:#c9e0a1 !important}
+.s-blue{background:#b9ddef !important}
+.s-purple{background:#d2c3e8 !important}
+
+/* Profile becomes a chalkboard identity card rather than white social card */
+.profile-cover{
+  background:
+    linear-gradient(rgba(23,63,53,.97),rgba(23,63,53,.97)),
+    repeating-linear-gradient(0deg,transparent 0 28px,rgba(255,255,255,.025) 29px) !important;
+  border:6px solid var(--wood) !important;
+}
+.profile-header,
+.profile-section{
+  background:rgba(16,47,40,.80) !important;
+  color:var(--chalk) !important;
+  border:1px solid rgba(245,241,223,.30) !important;
+}
+.profile-avatar{
+  background:var(--chalk) !important;
+  color:var(--chalkboard-deep) !important;
+  border-color:var(--wood) !important;
+}
+
+/* Dividers resemble chalk strokes */
+hr{
+  border:none !important;
+  border-top:1px dashed rgba(245,241,223,.35) !important;
+}
+
+/* Popovers/dialogs remain readable like paper forms placed over the board */
+div[role="dialog"],
+[data-baseweb="modal"] > div{
+  background:#f8f3e5 !important;
+  color:#24322e !important;
+}
+div[role="dialog"] h1,
+div[role="dialog"] h2,
+div[role="dialog"] h3,
+div[role="dialog"] p,
+div[role="dialog"] label{
+  color:#24322e !important;
+}
+
+/* Login page gets a centered framed chalkboard card */
+[data-testid="stForm"]{
+  padding:18px !important;
+}
+
+/* Mobile */
+@media(max-width:780px){
+  .block-container,[data-testid="stMain"] .block-container{
+    padding:24px 14px 55px !important;
+  }
+  [data-testid="stMainBlockContainer"]{
+    border-left:4px solid var(--wood-dark);
+    border-right:4px solid var(--wood-dark);
+  }
+  .page-title{font-size:30px !important}
+}
+</style>
+""",unsafe_allow_html=True)
+
+
