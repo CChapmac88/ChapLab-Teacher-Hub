@@ -1085,7 +1085,7 @@ def review_username_request(request_id,approve,review_note=""):
     c.execute(
         """UPDATE username_change_requests
            SET status=?,reviewed_at=?,reviewed_by=?,review_note=? WHERE id=?""",
-        (status,now,current_author_name() if "current_author_name" in globals() else "Creator",
+        (status,now,current_author_name() if "current_author_name" in globals() else "ChapLab App Creator & Administrator",
          _username_clean(review_note),int(request_id))
     )
     if approve:
@@ -1110,7 +1110,7 @@ def enforce_initial_username_choice():
 
     st.markdown("## 👋 One-Time Username Choice")
     st.info(
-        "On your first sign-in, you may keep your current username or change it once. "
+        "You may change your username one time from Profile Settings. "
         "After this screen is completed, future username changes require Creator/Admin approval."
     )
     current=state["username"] or str(auth.get("username","")).strip()
@@ -1147,7 +1147,6 @@ def enforce_initial_username_choice():
 
     st.stop()
 
-enforce_initial_username_choice()
 
 # ---------- Helpers ----------
 def nm(row): return f"{row['first_name']} {row['last_name']}"
@@ -4476,28 +4475,113 @@ with st.container(border=True):
         st.markdown("---")
         st.markdown("#### 🔑 Login Username")
         user_state=auth_username_state()
-        st.caption(f"Current username: {user_state['username']}")
-        if user_state["initial_choice_used"]:
-            st.caption("Your one-time username choice has been used. Additional changes require Creator/Admin approval.")
-            requested_username=st.text_input(
-                "Request a new username",
-                placeholder="3–30 characters: letters, numbers, . _ -",
-                key="prof_username_request"
+        st.caption(f"Current username: **{user_state['username']}**")
+
+        CREATOR_ADMIN_TITLE="ChapLab App Creator & Administrator"
+
+        if not user_state["initial_choice_used"]:
+            st.caption(
+                "You have one self-service username change available. "
+                "Your current username will remain unchanged unless you choose to change it."
             )
-            request_reason=st.text_area(
-                "Reason for change (optional)",
-                placeholder="Tell the Creator/Admin why you would like the username changed.",
-                height=75,key="prof_username_reason"
+
+            @st.dialog("Change Username")
+            def _first_username_change_dialog():
+                current_state=auth_username_state()
+                st.warning(
+                    f"**This is your one-time self-service username change.**\n\n"
+                    f"After you save a new username, any future username changes must be submitted "
+                    f"to the **{CREATOR_ADMIN_TITLE}** for approval."
+                )
+                st.write(f"Current username: **{current_state['username']}**")
+                proposed=st.text_input(
+                    "New username",
+                    placeholder="3–30 characters: letters, numbers, . _ -",
+                    key="settings_first_username_new"
+                )
+                cleaned=_username_clean(proposed)
+
+                if proposed and not _username_valid(cleaned):
+                    st.warning(
+                        "Use 3–30 characters with no spaces. "
+                        "Letters, numbers, periods, underscores, and hyphens are allowed."
+                    )
+
+                if st.button(
+                    "Save One-Time Username Change",
+                    type="primary",
+                    use_container_width=True,
+                    key="settings_save_first_username"
+                ):
+                    if not _username_valid(cleaned):
+                        st.error("Enter a valid username first.")
+                    elif cleaned==current_state["username"]:
+                        st.info("That is already your current username.")
+                    else:
+                        save_initial_username_choice(cleaned)
+                        st.success(f"Username changed to **{cleaned}**.")
+                        st.rerun()
+
+            if st.button(
+                "Change Username",
+                key="settings_open_first_username_change",
+                use_container_width=True
+            ):
+                _first_username_change_dialog()
+
+        else:
+            st.caption(
+                f"Your one-time self-service username change has been used. "
+                f"Future changes require approval from the **{CREATOR_ADMIN_TITLE}**."
             )
-            if st.button("Send Username Change Request",key="prof_send_username_request"):
-                cleaned=_username_clean(requested_username)
-                if not _username_valid(cleaned):
-                    st.error("Use 3–30 characters with no spaces. Letters, numbers, periods, underscores, and hyphens are allowed.")
-                elif cleaned==user_state["username"]:
-                    st.info("That is already your current username.")
-                else:
-                    submit_username_change_request(cleaned,request_reason)
-                    st.success("Username change request sent to Creator/Admin.")
+
+            @st.dialog("Request Username Change")
+            def _username_change_request_dialog():
+                current_state=auth_username_state()
+                st.info(
+                    f"This request will be forwarded to the **{CREATOR_ADMIN_TITLE}** for approval. "
+                    "Your current username will continue to work unless the request is approved."
+                )
+                st.write(f"Current username: **{current_state['username']}**")
+
+                requested=st.text_input(
+                    "Requested username",
+                    placeholder="3–30 characters: letters, numbers, . _ -",
+                    key="settings_requested_username"
+                )
+                reason=st.text_area(
+                    "Reason for change (optional)",
+                    placeholder="Explain why you would like your username changed.",
+                    height=85,
+                    key="settings_username_request_reason"
+                )
+
+                if st.button(
+                    "Send Request for Approval",
+                    type="primary",
+                    use_container_width=True,
+                    key="settings_send_username_request"
+                ):
+                    cleaned=_username_clean(requested)
+                    if not _username_valid(cleaned):
+                        st.error(
+                            "Use 3–30 characters with no spaces. "
+                            "Letters, numbers, periods, underscores, and hyphens are allowed."
+                        )
+                    elif cleaned==current_state["username"]:
+                        st.info("That is already your current username.")
+                    else:
+                        submit_username_change_request(cleaned,reason)
+                        st.success(
+                            f"Username change request sent to the **{CREATOR_ADMIN_TITLE}**."
+                        )
+
+            if st.button(
+                "Change Username",
+                key="settings_open_username_request",
+                use_container_width=True
+            ):
+                _username_change_request_dialog()
 
         st.markdown("---")
         st.markdown("#### Newsletter Role")
@@ -4560,7 +4644,7 @@ with st.container(border=True):
 
 
             st.markdown("---")
-            st.markdown("#### 🔑 Username Change Requests")
+            st.markdown("#### 🔑 Username Change Requests — App Administration")
             pending_names=pending_username_requests()
             if pending_names.empty:
                 st.caption("No username change requests are waiting.")
@@ -4621,7 +4705,7 @@ with st.container(border=True):
             st.markdown("---")
             st.markdown("#### 👥 Team & Role Management")
             st.caption(
-                "Until the Dean role is released, Creator/Admin controls Grade Team Leader and Newsletter Lead assignments. "
+                "Until the Dean role is released, the ChapLab App Creator & Administrator controls Grade Team Leader and Newsletter Lead assignments. "
                 "When Dean is enabled, this same structure will move to the appropriate Dean permissions."
             )
             staff=approved_staff_df()
