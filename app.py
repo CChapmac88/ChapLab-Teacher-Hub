@@ -209,6 +209,54 @@ def touch_staff_last_seen(email):
     )
     c.commit(); c.close()
 
+def creator_add_staff_account(email,display_name,role_type="Teacher",grade_band="",subjects=None,approval_status="Approved"):
+    """Creator/Admin manually adds a school staff account."""
+    email=str(email or "").strip().lower()
+    display_name=str(display_name or "").strip()
+    role_type=str(role_type or "Teacher").strip()
+    grade_band=str(grade_band or "").strip()
+    subjects=subjects or []
+
+    if not valid_school_staff_email(email):
+        return False,"Email must start with 79. and end with @nhaschools.com."
+    if not display_name:
+        return False,"Enter the staff member's name."
+
+    c=conn()
+    existing=c.execute(
+        "SELECT id FROM staff_accounts WHERE lower(email)=lower(?) LIMIT 1",
+        (email,)
+    ).fetchone()
+    if existing:
+        c.close()
+        return False,"That school email already has a ChapLab account."
+
+    now=datetime.now().isoformat(timespec="seconds")
+    c.execute(
+        """INSERT INTO staff_accounts(
+           email,display_name,role_type,grade_band,subjects,
+           approval_status,active,created_at,approved_at,approved_by,
+           password_setup_required)
+           VALUES (?,?,?,?,?,?,1,?,?,?,?,1)""",
+        (
+            email,display_name,role_type,grade_band,json.dumps(subjects),
+            approval_status,now,
+            now if approval_status=="Approved" else "",
+            "ChapLab App Creator & Administrator" if approval_status=="Approved" else ""
+        )
+    )
+    c.execute(
+        """INSERT INTO staff_login_activity(staff_email,logged_in_at,event_type,details)
+           VALUES (?,?,?,?)""",
+        (email,now,"Account Created","Manually added by ChapLab App Creator & Administrator")
+    )
+    c.commit(); c.close()
+    return True,(
+        f"{display_name} was added. "
+        + ("They can use the initial access code to set up their password." if approval_status=="Approved"
+           else "Their account is pending approval.")
+    )
+
 def all_staff_accounts_df():
     c=conn()
     df=pd.read_sql_query(
@@ -5037,6 +5085,62 @@ with st.container(border=True):
         if is_creator_account():
             st.markdown("---")
             st.markdown("#### 👤 Account Management")
+
+            with st.expander("➕ Add Someone Manually",expanded=False):
+                st.caption(
+                    "Add a staff member directly to ChapLab. School accounts must use the "
+                    "79.…@nhaschools.com email format."
+                )
+                with st.form("creator_manual_staff_add",clear_on_submit=True):
+                    ma1,ma2=st.columns(2)
+                    manual_name=ma1.text_input("Full name",placeholder="First and last name")
+                    manual_email=ma2.text_input("School email",placeholder="79.username@nhaschools.com")
+
+                    ma3,ma4=st.columns(2)
+                    manual_role=ma3.selectbox(
+                        "Role",
+                        ["Teacher","Specials Teacher","Special Education","Interventionist","Dean","Other"],
+                        key="manual_staff_role"
+                    )
+                    manual_grade=ma4.selectbox(
+                        "Grade / team",
+                        ["","Kindergarten","Grade 1","Grade 2","Grade 3","Grade 4","Grade 5",
+                         "Middle School","Specials","Special Education","Intervention","Administration","Other"],
+                        key="manual_staff_grade"
+                    )
+
+                    manual_subjects=st.multiselect(
+                        "Subject(s) — optional",
+                        ["ELA","Math","Science","Social Studies","Art","Music","Physical Education",
+                         "Technology","Spanish","Special Education","Intervention","Other"],
+                        key="manual_staff_subjects"
+                    )
+                    manual_approve=st.checkbox(
+                        "Approve this account now",
+                        value=True,
+                        help="If approved, they can sign in with the initial access code and create their own password."
+                    )
+                    manual_submit=st.form_submit_button(
+                        "Add Staff Account",
+                        type="primary",
+                        use_container_width=True
+                    )
+
+                if manual_submit:
+                    ok,msg=creator_add_staff_account(
+                        manual_email,
+                        manual_name,
+                        manual_role,
+                        manual_grade,
+                        manual_subjects,
+                        "Approved" if manual_approve else "Pending"
+                    )
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
             st.caption(
                 "View everyone registered for ChapLab, confirm who is active, see recent sign-in activity, "
                 "and deactivate accounts that should no longer have access."
