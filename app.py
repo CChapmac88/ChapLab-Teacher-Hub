@@ -4185,6 +4185,112 @@ def set_demo_mode(enabled,grade_label):
             st.session_state["selected_class"]=0
     return None
 
+
+# ---------- Book Leveler: Book Finder + Scholar Fit ----------
+def scholar_current_reading_levels(sid):
+    fp=""
+    lx=""
+    try:
+        br=benchmark_for_scholar(int(sid))
+    except Exception:
+        br=None
+    if br:
+        for key in ("fp_spring_level","fp_winter_level","fp_fall_level"):
+            try:
+                value=(br[key] or "").strip().upper()
+            except Exception:
+                value=""
+            if value:
+                fp=value
+                break
+        for key in ("lexile_spring","lexile_winter","lexile_fall","lexile"):
+            try:
+                value=(br[key] or "").strip().upper()
+            except Exception:
+                value=""
+            if value:
+                lx=value
+                break
+    return fp,lx
+
+def book_comparison_levels(book):
+    book=book or {}
+    sch=book.get("scholastic") or {}
+    levels=sch.get("levels") or {}
+    direct_fp=(levels.get("fountas_pinnell") or levels.get("guided_reading") or "").strip().upper()
+    lexile=(book.get("lexile_measure") or levels.get("lexile") or "").strip().upper()
+    est_fp=((book.get("estimated_fp_from_lexile") or {}).get("estimate") or "").strip().upper()
+    return direct_fp or est_fp,lexile,direct_fp,est_fp
+
+def classify_roster_for_book(book,roster_df):
+    groups={
+        "Likely to Struggle":[],
+        "Okay / With Support":[],
+        "Little to No Problems":[],
+        "Need More Data":[]
+    }
+    if roster_df is None or roster_df.empty:
+        return groups
+    book_fp,book_lx,_,_=book_comparison_levels(book)
+    for _,row in roster_df.iterrows():
+        sid=int(row["id"])
+        name=nm(row)
+        sfp,slx=scholar_current_reading_levels(sid)
+        fit,use,why=evaluate_book_fit(
+            book_fp=book_fp,book_lexile=book_lx,
+            scholar_fp=sfp,scholar_lexile=slx
+        )
+        item={"name":name,"fp":sfp,"lexile":slx,"fit":fit,"use":use,"why":why}
+        if fit=="Too Difficult Right Now":
+            groups["Likely to Struggle"].append(item)
+        elif fit=="Slightly Challenging":
+            groups["Okay / With Support"].append(item)
+        elif fit in ("Good Fit","Likely Too Easy"):
+            groups["Little to No Problems"].append(item)
+        else:
+            groups["Need More Data"].append(item)
+    return groups
+
+def enrich_book_result(book):
+    if not isinstance(book,dict):
+        return book
+    isbn=re.sub(r"[^0-9Xx]","",str(book.get("isbn") or ""))
+    if len(isbn) in (10,13):
+        try:
+            researched=internet_book_lookup_isbn(isbn)
+            if researched:
+                return researched
+        except Exception:
+            pass
+    return book
+
+def catalog_recommendations_for_scholar(sid,limit=20):
+    sfp,slx=scholar_current_reading_levels(sid)
+    c=conn()
+    try:
+        cat=pd.read_sql_query("SELECT * FROM book_catalog ORDER BY title",c)
+    except Exception:
+        cat=pd.DataFrame()
+    c.close()
+    recs=[]
+    if cat.empty:
+        return recs,sfp,slx
+    for _,r in cat.iterrows():
+        book_fp=str(r.get("fp_level") or "").strip().upper()
+        fit,use,why=evaluate_book_fit(
+            book_fp=book_fp,book_lexile="",
+            scholar_fp=sfp,scholar_lexile=slx
+        )
+        if fit in ("Good Fit","Slightly Challenging"):
+            recs.append({
+                "title":str(r.get("title") or "Untitled"),
+                "author":str(r.get("author") or ""),
+                "fp":book_fp,"fit":fit,"use":use,"why":why
+            })
+    rank={"Good Fit":0,"Slightly Challenging":1}
+    recs=sorted(recs,key=lambda x:(rank.get(x["fit"],9),x["title"].lower()))
+    return recs[:limit],sfp,slx
+
 # ---------- App Shell ----------
 # Honor saved Demo Mode without touching real data.
 _demo_state=demo_setting()
@@ -5774,511 +5880,231 @@ elif page=="Scholar Binder":
             if st.button("Save Letter Scale",key="save_scale_v9"):
                 save_setting("scale",[[str(r.Letter),float(r.Minimum),float(r.Maximum)] for _,r in se.iterrows()]); st.success("Saved.")
 elif page=="Book Leveler":
-    st.markdown('<div class="page-title">Book Leveler</div><div class="page-subtitle">Search books online, save verified F&P levels, and check fit for a scholar.</div>',unsafe_allow_html=True)
-    st.markdown("## 📚 Book Level Checker")
-    st.caption(
-        "Search Open Library by title or ISBN and save verified F&P levels anytime. "
-        "When scholars are added, ChapLab will also compare books with their current reading level."
+    st.markdown(
+        '<div class="page-title">Book Leveler</div>'
+        '<div class="page-subtitle">Start with a book or start with a scholar.</div>',
+        unsafe_allow_html=True
     )
-
     roster=scholars_df(selected_class or None)
-    current_fp=""
-    scholar_name=""
-
-    if roster.empty:
-        st.info("No scholars yet — book search and My Book Catalog are still fully available. Scholar reading-level comparisons will appear automatically after a roster is added.")
-    else:
-        sid=st.selectbox(
-            "Compare book with scholar (optional)",
-            list(roster.id.astype(int)),
-            format_func=lambda x:nm(roster[roster.id==x].iloc[0]),
-            key="book_checker_student_v32"
-        )
-        scholar_name=nm(roster[roster.id==sid].iloc[0])
-        br=benchmark_for_scholar(sid)
-        if br:
-            current_fp=(br["fp_spring_level"] or br["fp_fall_level"] or "").strip().upper()
-
-        if current_fp:
-            st.success(f"{scholar_name}'s current F&P level: **{current_fp}**")
-        else:
-            st.caption(f"No F&P level is saved for {scholar_name} yet. You can still search and save books.")
-
-    tabs=st.tabs(["Search Internet","My Book Catalog"])
+    tabs=st.tabs(["🔎 Book Finder","👩🏽‍🎓 Scholar Fit","📚 My Book Catalog"])
 
     with tabs[0]:
-        # Apply scan/manual changes before keyed search widgets are instantiated.
         _pending_query=st.session_state.pop("_book_pending_query",None)
         if _pending_query is not None:
             st.session_state["book_online_query"]=str(_pending_query)
 
         _pending_lookup=st.session_state.pop("_book_pending_lookup_isbn",None)
         if _pending_lookup:
-            with st.spinner("Checking Google Books, Scholastic, and Open Library..."):
+            with st.spinner("Book Finder is checking reading-level sources..."):
                 researched=internet_book_lookup_isbn(_pending_lookup)
             st.session_state["book_online_results"]=[researched] if researched else []
-            st.session_state["book_selected_result_idx"]=0 if researched else None
-            st.session_state["book_selected_result"]=researched if researched else None
-
             if researched:
-                sch=researched.get("scholastic") or {}
-                levels=sch.get("levels") or {}
-                level_bits=[]
-                if levels.get("fountas_pinnell"):
-                    level_bits.append(f"F&P {levels['fountas_pinnell']}")
-                if levels.get("guided_reading"):
-                    level_bits.append(f"Guided Reading {levels['guided_reading']}")
-                lexile_value=(researched.get("lexile_measure") or levels.get("lexile") or "").strip()
-                if lexile_value:
-                    level_bits.append(f"Lexile {lexile_value}")
-                fp_guess=(researched.get("estimated_fp_from_lexile") or {}).get("estimate")
-                if fp_guess:
-                    level_bits.append(f"Estimated F&P {fp_guess}")
-                suffix=(" • "+", ".join(level_bits)) if level_bits else ""
                 st.session_state["_book_scan_message"]=(
                     f"✅ ISBN **{_pending_lookup}** researched automatically. "
-                    f"**{researched.get('title','Book')}** loaded{suffix}."
+                    f"**{researched.get('title','Book')}** loaded."
                 )
 
-        st.markdown("### Search Internet")
-
-        st.markdown("#### Identify book by")
-        identify_mode=st.radio(
-            "Choose how to enter the book",
-            ["Camera","Upload Barcode Photo","Type ISBN / Search"],
-            horizontal=True,
-            key="book_identify_mode"
+        st.markdown("### 🔎 Book Finder")
+        st.caption(
+            "Start with a book. Scan the ISBN or type the title, author, or ISBN. "
+            "ChapLab researches its reading level and shows which scholars may struggle, "
+            "which scholars should be okay with support, and which should have little to no difficulty."
         )
 
         def clear_book_scanner():
-            """Clear current book and force a fresh live-scanner instance."""
             for k in (
-                "book_camera_isbn",
-                "book_camera_manual_correction",
-                "book_online_query",
-                "book_online_results",
-                "book_selected_result",
-                "book_selected_result_idx",
-                "_book_scan_message",
-                "_book_scan_error",
-                "_last_camera_scan_token",
-                "_last_live_scanned_value",
-                "_last_autolookup_isbn",
-                "_book_pending_query",
-                "_book_pending_lookup_isbn",
-                "book_verified_fp_online",
+                "book_camera_isbn","book_camera_manual_correction","book_online_query",
+                "book_online_results","book_selected_result","book_selected_result_idx",
+                "_book_scan_message","_book_scan_error","_last_camera_scan_token",
+                "_last_live_scanned_value","_last_autolookup_isbn",
+                "_book_pending_query","_book_pending_lookup_isbn","book_verified_fp_online",
+                "_bookfinder_enriched_key","_bookfinder_enriched_book"
             ):
                 st.session_state.pop(k,None)
-
             st.session_state["book_online_query"]=""
             st.session_state["book_camera_manual_correction"]=""
             st.session_state["book_camera_isbn"]=""
             st.session_state["book_online_results"]=[]
             st.session_state["book_online_search_mode"]="ISBN"
-            st.session_state["book_live_scanner_nonce"]=int(
-                st.session_state.get("book_live_scanner_nonce",0)
-            )+1
+            st.session_state["book_live_scanner_nonce"]=int(st.session_state.get("book_live_scanner_nonce",0))+1
 
+        identify_mode=st.radio(
+            "Find book by",
+            ["Camera","Upload Barcode Photo","Type Title / Author / ISBN"],
+            horizontal=True,key="book_identify_mode"
+        )
 
         if identify_mode=="Camera":
-            scan_title_col,scan_clear_col=st.columns([3,1])
-            with scan_title_col:
-                st.markdown("#### 📷 Automatic ISBN Scanner")
-            with scan_clear_col:
-                if st.button("🧹 Clear / Scan New Book",key="clear_camera_book",use_container_width=True):
-                    clear_book_scanner()
-                    st.rerun()
-
-            st.info(
-                "Choose **Front Camera** or **Back Camera** and hold the book's ISBN barcode inside the guide. "
-                "ChapLab detects the barcode automatically — no tapping and no photo button."
-            )
-            st.caption("The camera preview is shown normally, not mirrored.")
-
+            c1,c2=st.columns([3,1])
+            c1.markdown("#### 📷 Automatic ISBN Scanner")
+            if c2.button("🧹 Clear / New Book",key="clear_camera_book",use_container_width=True):
+                clear_book_scanner(); st.rerun()
             nonce=int(st.session_state.get("book_live_scanner_nonce",0))
-            scanned_value=chaplab_auto_barcode_scanner(
-                key=f"chaplab_auto_barcode_{nonce}"
-            )
-
-            if scanned_value:
-                raw_value=str(scanned_value).strip()
-                cleaned=re.sub(r"[^0-9Xx]","",raw_value)
-
-                if raw_value!=st.session_state.get("_last_live_scanned_value"):
-                    st.session_state["_last_live_scanned_value"]=raw_value
-
+            scanned=chaplab_auto_barcode_scanner(key=f"chaplab_auto_barcode_{nonce}")
+            if scanned:
+                raw=str(scanned).strip()
+                cleaned=re.sub(r"[^0-9Xx]","",raw)
+                if raw!=st.session_state.get("_last_live_scanned_value"):
+                    st.session_state["_last_live_scanned_value"]=raw
                     if len(cleaned) in (10,13):
                         st.session_state["book_camera_manual_correction"]=cleaned
                         st.session_state["book_online_search_mode"]="ISBN"
                         queue_book_isbn_lookup(cleaned)
                         st.rerun()
                     else:
-                        st.session_state["_book_scan_error"]=(
-                            f"The camera read `{raw_value}`, but it is not a 10- or 13-digit ISBN."
-                        )
+                        st.session_state["_book_scan_error"]=f"`{raw}` was not read as a valid ISBN."
                         st.rerun()
-
             if st.session_state.get("_book_scan_error"):
                 st.warning(st.session_state.pop("_book_scan_error"))
-
             if st.session_state.get("_book_scan_message"):
                 st.success(st.session_state["_book_scan_message"])
 
-            detected_value=st.session_state.get("book_camera_isbn","")
-            if detected_value and st.session_state.get("book_camera_manual_correction")!=detected_value:
-                st.session_state["book_camera_manual_correction"]=detected_value
+            detected=st.session_state.get("book_camera_isbn","")
+            if detected and st.session_state.get("book_camera_manual_correction")!=detected:
+                st.session_state["book_camera_manual_correction"]=detected
 
-            def _camera_manual_isbn_changed():
-                raw=st.session_state.get("book_camera_manual_correction","")
-                cleaned=re.sub(r"[^0-9Xx]","",raw or "")
-                if len(cleaned) not in (10,13):
-                    return
-                if cleaned==st.session_state.get("_last_autolookup_isbn"):
-                    return
-                st.session_state["book_online_search_mode"]="ISBN"
-                queue_book_isbn_lookup(cleaned)
+            def _bf_manual_changed():
+                cleaned=re.sub(r"[^0-9Xx]","",st.session_state.get("book_camera_manual_correction",""))
+                if len(cleaned) in (10,13) and cleaned!=st.session_state.get("_last_autolookup_isbn"):
+                    st.session_state["book_online_search_mode"]="ISBN"
+                    queue_book_isbn_lookup(cleaned)
 
-            manual_cam=st.text_input(
+            st.text_input(
                 "Detected ISBN / manual correction",
-                placeholder="978...",
-                key="book_camera_manual_correction",
-                on_change=_camera_manual_isbn_changed
+                placeholder="978...",key="book_camera_manual_correction",
+                on_change=_bf_manual_changed
             )
-
-            if st.session_state.get("book_camera_isbn"):
-                st.caption(
-                    "ChapLab automatically searched the detected ISBN. If the wrong book appears, "
-                    "correct the ISBN here and ChapLab searches again automatically."
-                )
-                st.caption("Ready for another book? Use **Clear / Scan New Book** above.")
 
         elif identify_mode=="Upload Barcode Photo":
-            barcode_upload=st.file_uploader(
-                "Upload a clear photo of the ISBN barcode",
-                type=["png","jpg","jpeg","webp"],
-                key="book_barcode_photo_upload"
+            upload=st.file_uploader(
+                "Upload a clear ISBN barcode photo",
+                type=["png","jpg","jpeg","webp"],key="book_barcode_photo_upload"
             )
-            if barcode_upload is not None:
-                st.image(barcode_upload,caption="Barcode photo",width=350)
-                if st.button("🔎 Read Barcode & Find Book",key="read_uploaded_book_barcode"):
-                    with st.spinner("Reading ISBN barcode..."):
-                        detected,error=decode_isbn_barcode(barcode_upload)
-                    if not detected:
-                        st.warning(error)
-                    else:
-                        st.session_state["book_camera_isbn"]=detected
+            if upload is not None:
+                st.image(upload,width=350)
+                if st.button("Read Barcode & Find Book",key="read_uploaded_book_barcode"):
+                    detected,error=decode_isbn_barcode(upload)
+                    if detected:
                         st.session_state["book_camera_manual_correction"]=detected
                         st.session_state["book_online_search_mode"]="ISBN"
-                        st.session_state["book_online_query"]=detected
-                        try:
-                            found=openlibrary_lookup_isbn(detected)
-                            st.session_state["book_online_results"]=[found] if found else []
-                            if found:
-                                st.success(f"ISBN {detected} detected and book information loaded.")
-                            else:
-                                st.warning(f"ISBN {detected} detected, but Open Library did not return a matching book.")
-                        except Exception as e:
-                            st.error(str(e))
+                        queue_book_isbn_lookup(detected)
                         st.rerun()
+                    else:
+                        st.warning(error)
 
-        # These normal search controls remain visible for typing, correction,
-        # or searching by title/author even after a barcode scan.
         search_mode=st.radio(
-            "Search by",
-            ["Title / Author / Keyword","ISBN"],
-            horizontal=True,
-            key="book_online_search_mode"
+            "Search by",["Title / Author / Keyword","ISBN"],
+            horizontal=True,key="book_online_search_mode"
         )
-
-        # IMPORTANT: scanned ISBN is written into this exact widget key before rerun,
-        # so the main search field visibly populates.
         q=st.text_input(
             "Book title, author, keywords, or ISBN",
-            placeholder="Example: Charlotte's Web or 9780064400558",
+            placeholder="Example: Charlotte's Web, E. B. White, or 9780064400558",
             key="book_online_query"
         )
-
-        if st.button("Search Internet",key="book_search_internet"):
+        if st.button("🔎 Find Book & Reading Levels",key="book_search_internet"):
             try:
                 if search_mode=="ISBN":
-                    cleaned_q=re.sub(r"[^0-9Xx]","",q or "")
-                    if len(cleaned_q) not in (10,13):
+                    cleaned=re.sub(r"[^0-9Xx]","",q or "")
+                    if len(cleaned) not in (10,13):
                         st.warning("Enter a valid 10- or 13-digit ISBN.")
                     else:
-                        with st.spinner("Checking Google Books, Scholastic, and Open Library..."):
-                            result=internet_book_lookup_isbn(cleaned_q)
-                        st.session_state["book_online_results"]=[result] if result else []
-                        st.session_state["book_selected_result_idx"]=0 if result else None
-                        st.session_state["book_selected_result"]=result if result else None
-                        if not result:
-                            st.warning("No matching book was found for that ISBN.")
+                        st.session_state["book_online_results"]=[internet_book_lookup_isbn(cleaned)]
                 else:
                     st.session_state["book_online_results"]=openlibrary_search_books(q,limit=10)
-                    if not st.session_state["book_online_results"]:
-                        st.warning("No matching books were found.")
             except Exception as e:
                 st.error(str(e))
 
-        online_results=st.session_state.get("book_online_results",[])
-        if online_results:
-            labels=[]
-            for i,b in enumerate(online_results):
-                title=b.get("title") or "Untitled"
-                author=b.get("author") or "Unknown author"
-                year=b.get("year") or b.get("publish_date") or ""
-                isbn=b.get("isbn") or ""
-                label=f"{title} — {author}"
-                if year:
-                    label+=f" ({year})"
-                if isbn:
-                    label+=f" | ISBN {isbn}"
-                labels.append(label)
-
+        results=st.session_state.get("book_online_results",[])
+        if results:
+            labels=[
+                f"{b.get('title') or 'Untitled'} — {b.get('author') or 'Unknown'}"
+                +(f" | ISBN {b.get('isbn')}" if b.get("isbn") else "")
+                for b in results
+            ]
             idx=st.selectbox(
-                "Select a result",
-                list(range(len(online_results))),
-                format_func=lambda x:labels[x],
-                key="book_online_result_select"
+                "Select the exact book",list(range(len(results))),
+                format_func=lambda i:labels[i],key="book_online_result_select"
             )
-            book=online_results[idx]
+            raw_book=results[idx]
+            enrich_key=f"{raw_book.get('isbn','')}|{raw_book.get('title','')}|{raw_book.get('author','')}"
+            if st.session_state.get("_bookfinder_enriched_key")!=enrich_key:
+                with st.spinner("Researching this edition's reading levels..."):
+                    book=enrich_book_result(raw_book)
+                st.session_state["_bookfinder_enriched_key"]=enrich_key
+                st.session_state["_bookfinder_enriched_book"]=book
+            else:
+                book=st.session_state.get("_bookfinder_enriched_book") or raw_book
 
-            cover_url=book.get("cover_url") or openlibrary_cover_url(book)
-            c1,c2=st.columns([1,2])
-            with c1:
-                if cover_url:
-                    st.image(cover_url,width=180)
-                else:
-                    st.caption("No cover image available.")
-            with c2:
-                st.markdown(f"**Title:** {book.get('title') or 'Untitled'}")
-                st.write(f"**Author:** {book.get('author') or 'Unknown'}")
-                if book.get("publisher"):
-                    st.write(f"**Publisher:** {book.get('publisher')}")
-                if book.get("year") or book.get("publish_date"):
-                    st.write(f"**Published:** {book.get('year') or book.get('publish_date')}")
-                if book.get("isbn"):
-                    st.write(f"**ISBN:** {book.get('isbn')}")
+            cover=book.get("cover_url") or openlibrary_cover_url(book)
+            a,b=st.columns([1,2])
+            if cover:
+                a.image(cover,width=180)
+            b.markdown(f"**{book.get('title') or 'Untitled'}**")
+            b.write(f"Author: {book.get('author') or 'Unknown'}")
+            if book.get("isbn"):
+                b.write(f"ISBN: {book.get('isbn')}")
 
-            research=book.get("lookup_sources") or {}
-            if research:
-                source_text=" • ".join(
-                    [f"{name}: {'✓' if ok else '—'}" for name,ok in research.items()]
-                )
-                st.caption("Internet checks: "+source_text)
+            sch=book.get("scholastic") or {}
+            levels=sch.get("levels") or {}
+            lexile=(book.get("lexile_measure") or levels.get("lexile") or "").strip().upper()
+            fp_est=book.get("estimated_fp_from_lexile") or {}
+            direct_fp=(levels.get("fountas_pinnell") or levels.get("guided_reading") or "").strip().upper()
 
-            scholastic=book.get("scholastic") or {}
-            sch_levels=scholastic.get("levels") or {}
-            lexile_info=book.get("lexile_hub") or {}
-            lexile_measure=(book.get("lexile_measure") or sch_levels.get("lexile") or "").strip().upper()
-            fp_est=(book.get("estimated_fp_from_lexile") or {})
-            if lexile_measure or sch_levels:
-                st.markdown("#### 📚 Reading Levels Found Online")
-
-            if lexile_measure:
-                st.success(f"**Lexile Measure:** {lexile_measure}")
-                if lexile_info.get("found"):
-                    st.caption("Lexile source: MetaMetrics Lexile Find a Book")
-                elif sch_levels.get("lexile"):
-                    st.caption("Lexile source: Scholastic")
-
-                fp_guess=(fp_est.get("estimate") or "").strip()
-                if fp_guess:
-                    st.info(
-                        f"**Estimated F&P from Lexile:** {fp_guess}\n\n"
-                        "This is an approximate crosswalk, not an official Fountas & Pinnell conversion."
-                    )
-
-            if sch_levels:
-                if sch_levels.get("fountas_pinnell"):
-                    st.success(f"**Scholastic Fountas & Pinnell:** {sch_levels['fountas_pinnell']}")
-                if sch_levels.get("guided_reading"):
-                    st.success(f"**Scholastic Guided Reading Level:** {sch_levels['guided_reading']}")
-                if sch_levels.get("lexile"):
-                    st.write(f"**Scholastic Lexile:** {sch_levels['lexile']}")
-                if sch_levels.get("dra"):
-                    st.write(f"**Scholastic DRA:** {sch_levels['dra']}")
-                if sch_levels.get("grade_level"):
-                    st.write(f"**Scholastic Grade Level:** {sch_levels['grade_level']}")
-            elif not lexile_measure:
-                st.info(
-                    "No Lexile or Scholastic reading level was found automatically for this edition. "
-                    "ChapLab will not invent a level."
-                )
-
-            google_info=book.get("google_books") or {}
-            if google_info:
-                extra=[]
-                if google_info.get("page_count"):
-                    extra.append(f"{google_info['page_count']} pages")
-                if google_info.get("categories"):
-                    extra.append(", ".join(google_info["categories"][:2]))
-                if extra:
-                    st.caption("Google Books: "+" • ".join(extra))
-
-            _sch_fp=(sch_levels.get("fountas_pinnell") or "").strip().upper() if 'sch_levels' in locals() else ""
-            if _sch_fp and not st.session_state.get("book_verified_fp_online"):
-                st.session_state["book_verified_fp_online"]=_sch_fp
+            st.markdown("#### Reading Level")
+            if direct_fp:
+                st.success(f"Published Guided Reading/F&P: **{direct_fp}**")
+            if lexile:
+                st.success(f"Lexile: **{lexile}**")
+            if levels.get("grade_level"):
+                st.write(f"Grade level: **{levels['grade_level']}**")
+            if not direct_fp and fp_est.get("estimate"):
+                st.info(f"Estimated F&P from Lexile: **{fp_est['estimate']}**")
 
             st.markdown("---")
-            st.markdown("### 👩🏽‍🎓 Is This Book a Good Fit for a Scholar?")
-
-            # Pull from the same scholar roster already used throughout ChapLab.
-            _fit_scholars=[]
-            for _key in ("students","scholars","student_roster","roster"):
-                _candidate=st.session_state.get(_key)
-                if isinstance(_candidate,list) and _candidate:
-                    _fit_scholars=_candidate
-                    break
-
-            _fit_names=[]
-            _fit_records={}
-            for _s in _fit_scholars:
-                if isinstance(_s,dict):
-                    _nm=str(_s.get("name") or _s.get("student_name") or _s.get("scholar_name") or "").strip()
-                    if _nm:
-                        _fit_names.append(_nm)
-                        _fit_records[_nm]=_s
-                elif str(_s).strip():
-                    _fit_names.append(str(_s).strip())
-                    _fit_records[str(_s).strip()]={}
-
-            if _fit_names:
-                _selected_fit=st.selectbox(
-                    "Select scholar",
-                    ["— Select scholar —"]+sorted(set(_fit_names)),
-                    key="book_fit_scholar"
-                )
+            st.markdown("### 👥 Class Book Fit")
+            if roster.empty:
+                st.info("Add scholars to this class to compare the book with the roster.")
             else:
-                _selected_fit="— Select scholar —"
-                st.info(
-                    "Add scholars to your roster and they will appear here automatically. "
-                    "You can still enter a scholar's current level below for a quick comparison."
-                )
-
-            _saved_fp,_saved_lx=("","")
-            if _selected_fit!="— Select scholar —":
-                _saved_fp,_saved_lx=_scholar_level_from_record(_fit_records.get(_selected_fit,{}))
-
-            _fc1,_fc2=st.columns(2)
-            with _fc1:
-                _scholar_fp=st.text_input(
-                    "Scholar current F&P / Guided Reading",
-                    value=_saved_fp,
-                    placeholder="Example: L",
-                    key=f"book_fit_fp_{_selected_fit}"
-                ).strip().upper()
-            with _fc2:
-                _scholar_lx=st.text_input(
-                    "Scholar current Lexile",
-                    value=_saved_lx,
-                    placeholder="Example: 520L",
-                    key=f"book_fit_lexile_{_selected_fit}"
-                ).strip().upper()
-
-            # Direct published book level wins. Estimated F&P is used only if no direct level exists.
-            _direct_book_fp=(
-                (sch_levels.get("fountas_pinnell") or "")
-                or (sch_levels.get("guided_reading") or "")
-            ).strip().upper()
-            _estimated_book_fp=(fp_est.get("estimate") or "").strip().upper()
-            _comparison_book_fp=_direct_book_fp or _estimated_book_fp
-
-            if _selected_fit!="— Select scholar —" or _scholar_fp or _scholar_lx:
-                _fit,_use,_why=evaluate_book_fit(
-                    book_fp=_comparison_book_fp,
-                    book_lexile=lexile_measure,
-                    scholar_fp=_scholar_fp,
-                    scholar_lexile=_scholar_lx
-                )
-
-                if _fit=="Good Fit":
-                    st.success(f"### ✅ {_fit}\\n**Recommended use:** {_use}")
-                elif _fit=="Slightly Challenging":
-                    st.warning(f"### 🟡 {_fit}\\n**Recommended use:** {_use}")
-                elif _fit=="Too Difficult Right Now":
-                    st.error(f"### 🔴 {_fit}\\n**Recommended use:** {_use}")
-                elif _fit=="Likely Too Easy":
-                    st.info(f"### 🔵 {_fit}\\n**Recommended use:** {_use}")
-                else:
-                    st.info(f"### ⚪ {_fit}\\n**Recommended use:** {_use}")
-
-                st.write(_why)
-                _book_level_display=_direct_book_fp or (
-                    f"{_estimated_book_fp} (estimated from Lexile)" if _estimated_book_fp else "Not found"
-                )
-                st.caption(
-                    f"Book level used: {_book_level_display}"
-                    + (f" • Book Lexile: {lexile_measure}" if lexile_measure else "")
-                    + (f" • Scholar F&P: {_scholar_fp}" if _scholar_fp else "")
-                    + (f" • Scholar Lexile: {_scholar_lx}" if _scholar_lx else "")
-                )
-                st.caption(
-                    "Fit is a screening aid. Interest, background knowledge, decoding, fluency, and comprehension "
-                    "can make the same book appropriate for one purpose and not another."
-                )
-
-            st.caption(
-                "Use **Verified F&P** only when you have a direct source. "
-                "The Lexile conversion above is shown separately as an estimate."
-            )
+                groups=classify_roster_for_book(book,roster)
+                col1,col2,col3=st.columns(3)
+                specs=[
+                    (col1,"🔴 Likely to Struggle","Likely to Struggle"),
+                    (col2,"🟡 Okay / With Support","Okay / With Support"),
+                    (col3,"🟢 Little to No Problems","Little to No Problems"),
+                ]
+                for col,title,key in specs:
+                    with col:
+                        st.markdown(f"#### {title}")
+                        if not groups[key]:
+                            st.caption("None")
+                        for item in groups[key]:
+                            st.markdown(f"**{item['name']}**")
+                            st.caption(f"F&P {item['fp']}" if item["fp"] else "Reading level not saved")
+                if groups["Need More Data"]:
+                    st.caption("Need more data: "+", ".join(x["name"] for x in groups["Need More Data"]))
 
             verified_fp=st.text_input(
-                "Verified F&P level (optional)",
-                placeholder="Example: M",
-                key="book_verified_fp_online"
+                "Verified F&P level (optional)",value=direct_fp,
+                placeholder="Example: M",key="book_verified_fp_online"
             ).strip().upper()
-
-            notes=st.text_area(
-                "Book notes",
-                placeholder="Optional notes about this edition, classroom use, or source of the verified level.",
-                height=80,
-                key="book_online_notes"
-            )
-
-            if verified_fp and not re.fullmatch(r"[A-Z]",verified_fp):
-                st.warning("For automatic comparison, use a single F&P letter level A–Z.")
-
-            if verified_fp and current_fp:
-                relation=fp_level_relation(current_fp,verified_fp)
-                if relation:
-                    label,diff=relation
-                    if diff==0:
-                        st.success(f"This book is **on {scholar_name}'s current F&P level ({current_fp})**.")
-                    elif diff<0:
-                        st.info(
-                            f"This book is **{label.lower()}** for {scholar_name}: "
-                            f"book {verified_fp}, scholar {current_fp}."
-                        )
-                    else:
-                        st.warning(
-                            f"This book is **{label.lower()}** for {scholar_name}: "
-                            f"book {verified_fp}, scholar {current_fp}."
-                        )
+            notes=st.text_area("Book notes",height=70,key="book_online_notes")
 
             if st.button("Save to My Book Catalog",key="save_online_book"):
                 c=conn()
-                # Inspect catalog columns dynamically so this remains compatible
-                # with earlier ChapLab database versions.
                 cols=[r["name"] for r in c.execute("PRAGMA table_info(book_catalog)").fetchall()]
                 title=(book.get("title") or "Untitled").strip()
                 author=(book.get("author") or "").strip()
                 isbn=(book.get("isbn") or "").strip()
-
                 existing=None
                 if isbn and "isbn" in cols:
-                    existing=c.execute(
-                        "SELECT id FROM book_catalog WHERE isbn=? LIMIT 1",
-                        (isbn,)
-                    ).fetchone()
+                    existing=c.execute("SELECT id FROM book_catalog WHERE isbn=? LIMIT 1",(isbn,)).fetchone()
                 if not existing:
                     existing=c.execute(
                         "SELECT id FROM book_catalog WHERE lower(title)=lower(?) AND lower(COALESCE(author,''))=lower(?) LIMIT 1",
                         (title,author)
                     ).fetchone()
-
                 if existing:
-                    sets=[]
-                    vals=[]
+                    sets=[]; vals=[]
                     if "fp_level" in cols:
                         sets.append("fp_level=?"); vals.append(verified_fp)
                     if "isbn" in cols:
@@ -6288,28 +6114,118 @@ elif page=="Book Leveler":
                     if sets:
                         vals.append(int(existing["id"]))
                         c.execute(f"UPDATE book_catalog SET {','.join(sets)} WHERE id=?",vals)
-                    st.success("Book already existed; saved information was updated.")
                 else:
-                    insert_cols=["title"]
-                    insert_vals=[title]
-                    if "author" in cols:
-                        insert_cols.append("author"); insert_vals.append(author)
-                    if "fp_level" in cols:
-                        insert_cols.append("fp_level"); insert_vals.append(verified_fp)
-                    if "isbn" in cols:
-                        insert_cols.append("isbn"); insert_vals.append(isbn)
-                    if "notes" in cols:
-                        insert_cols.append("notes"); insert_vals.append(notes.strip())
-                    placeholders=",".join(["?"]*len(insert_cols))
+                    ic=["title"]; iv=[title]
+                    if "author" in cols: ic.append("author"); iv.append(author)
+                    if "fp_level" in cols: ic.append("fp_level"); iv.append(verified_fp)
+                    if "isbn" in cols: ic.append("isbn"); iv.append(isbn)
+                    if "notes" in cols: ic.append("notes"); iv.append(notes.strip())
                     c.execute(
-                        f"INSERT INTO book_catalog({','.join(insert_cols)}) VALUES ({placeholders})",
-                        insert_vals
+                        f"INSERT INTO book_catalog({','.join(ic)}) VALUES ({','.join(['?']*len(ic))})",iv
                     )
-                    st.success("Book saved to your ChapLab catalog.")
                 c.commit(); c.close()
-                st.rerun()
+                st.success("Book saved to My Book Catalog.")
 
     with tabs[1]:
+        st.markdown("### 👩🏽‍🎓 Scholar Fit")
+        st.caption(
+            "Start with a scholar. ChapLab shows saved books that fit, or you can enter any title, author, or ISBN "
+            "and ChapLab will research the book and tell you whether it is right for that scholar."
+        )
+        if roster.empty:
+            st.info("Add scholars to the selected class before using Scholar Fit.")
+        else:
+            sid=st.selectbox(
+                "Scholar",list(roster.id.astype(int)),
+                format_func=lambda x:nm(roster[roster.id==x].iloc[0]),
+                key="scholar_fit_selected"
+            )
+            scholar_name=nm(roster[roster.id==sid].iloc[0])
+            scholar_fp,scholar_lx=scholar_current_reading_levels(sid)
+
+            x1,x2=st.columns(2)
+            x1.metric("Current F&P / Guided Reading",scholar_fp or "Not saved")
+            x2.metric("Current Lexile",scholar_lx or "Not saved")
+
+            st.markdown("#### 📚 Recommended From My Book Catalog")
+            recs,_,_=catalog_recommendations_for_scholar(sid)
+            if not recs:
+                st.caption("No matching saved books yet. Check a specific book below or save books from Book Finder.")
+            else:
+                for r in recs:
+                    icon="✅" if r["fit"]=="Good Fit" else "🟡"
+                    line=f"{icon} **{r['title']}**"
+                    if r["author"]: line+=f" — {r['author']}"
+                    if r["fp"]: line+=f" | F&P {r['fp']}"
+                    st.markdown(line)
+                    st.caption(f"{r['fit']} • {r['use']}")
+
+            st.markdown("---")
+            st.markdown("#### 🔎 Check a Specific Book")
+            sq=st.text_input(
+                "Book title, author, or ISBN",
+                placeholder="Example: Frindle, Andrew Clements, or 9780689818769",
+                key="scholar_fit_book_query"
+            )
+            if st.button("Check This Book for Scholar",key="scholar_fit_search"):
+                query=sq.strip()
+                if not query:
+                    st.warning("Enter a title, author, or ISBN.")
+                else:
+                    cleaned=re.sub(r"[^0-9Xx]","",query)
+                    try:
+                        if len(cleaned) in (10,13) and re.fullmatch(r"[0-9Xx\-\s]+",query):
+                            st.session_state["scholar_fit_results"]=[internet_book_lookup_isbn(cleaned)]
+                        else:
+                            st.session_state["scholar_fit_results"]=openlibrary_search_books(query,limit=8)
+                    except Exception as e:
+                        st.error(str(e))
+
+            sf_results=st.session_state.get("scholar_fit_results",[])
+            if sf_results:
+                sf_labels=[
+                    f"{b.get('title') or 'Untitled'} — {b.get('author') or 'Unknown'}"
+                    +(f" | ISBN {b.get('isbn')}" if b.get("isbn") else "")
+                    for b in sf_results
+                ]
+                sf_idx=st.selectbox(
+                    "Choose the exact book",list(range(len(sf_results))),
+                    format_func=lambda i:sf_labels[i],key="scholar_fit_result_select"
+                )
+                sf_raw=sf_results[sf_idx]
+                sf_key=f"{sf_raw.get('isbn','')}|{sf_raw.get('title','')}|{sf_raw.get('author','')}"
+                if st.session_state.get("_scholar_fit_enriched_key")!=sf_key:
+                    with st.spinner("Checking reading levels..."):
+                        sf_book=enrich_book_result(sf_raw)
+                    st.session_state["_scholar_fit_enriched_key"]=sf_key
+                    st.session_state["_scholar_fit_enriched_book"]=sf_book
+                else:
+                    sf_book=st.session_state.get("_scholar_fit_enriched_book") or sf_raw
+
+                sf_fp,sf_lx,sf_direct,sf_est=book_comparison_levels(sf_book)
+                fit,use,why=evaluate_book_fit(
+                    book_fp=sf_fp,book_lexile=sf_lx,
+                    scholar_fp=scholar_fp,scholar_lexile=scholar_lx
+                )
+
+                st.markdown(f"**{sf_book.get('title') or 'Untitled'}** — {sf_book.get('author') or 'Unknown'}")
+                if sf_direct: st.write(f"Published Guided Reading/F&P: **{sf_direct}**")
+                elif sf_est: st.write(f"Estimated F&P: **{sf_est}**")
+                if sf_lx: st.write(f"Lexile: **{sf_lx}**")
+
+                if fit=="Good Fit":
+                    st.success(f"### ✅ Good Fit\n**{use}**")
+                elif fit=="Slightly Challenging":
+                    st.warning(f"### 🟡 Slightly Challenging\n**{use}**")
+                elif fit=="Too Difficult Right Now":
+                    st.error(f"### 🔴 Too Difficult Right Now\n**{use}**")
+                elif fit=="Likely Too Easy":
+                    st.info(f"### 🔵 Likely Too Easy\n**{use}**")
+                else:
+                    st.info(f"### ⚪ Need More Data\n**{use}**")
+                st.write(why)
+
+    with tabs[2]:
         st.markdown("### My Book Catalog")
         c=conn()
         catalog=pd.read_sql_query("SELECT * FROM book_catalog ORDER BY title",c)
