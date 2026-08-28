@@ -223,39 +223,68 @@ def creator_add_staff_account(email,display_name,role_type="Teacher",grade_band=
         return False,"Enter the staff member's name."
 
     c=conn()
-    existing=c.execute(
-        "SELECT id FROM staff_accounts WHERE lower(email)=lower(?) LIMIT 1",
-        (email,)
-    ).fetchone()
-    if existing:
-        c.close()
-        return False,"That school email already has a ChapLab account."
+    try:
+        existing=c.execute(
+            "SELECT id FROM staff_accounts WHERE lower(email)=lower(?) LIMIT 1",
+            (email,)
+        ).fetchone()
 
-    now=datetime.now().isoformat(timespec="seconds")
-    c.execute(
-        """INSERT INTO staff_accounts(
-           email,display_name,role_type,grade_band,subjects,
-           approval_status,active,created_at,approved_at,approved_by,
-           password_setup_required)
-           VALUES (?,?,?,?,?,?,1,?,?,?,?,1)""",
-        (
-            email,display_name,role_type,grade_band,json.dumps(subjects),
-            approval_status,now,
-            now if approval_status=="Approved" else "",
-            "ChapLab App Creator & Administrator" if approval_status=="Approved" else ""
+        if existing:
+            c.close()
+            return False,"That school email already has a ChapLab account."
+
+        now=datetime.now().isoformat(timespec="seconds")
+
+        c.execute(
+            """INSERT INTO staff_accounts(
+               email,display_name,role_type,grade_band,subjects,
+               approval_status,active,created_at,approved_at,approved_by,
+               password_setup_required)
+               VALUES (?,?,?,?,?,?,1,?,?,?,1)""",
+            (
+                email,
+                display_name,
+                role_type,
+                grade_band,
+                json.dumps(subjects),
+                approval_status,
+                now,
+                now if approval_status=="Approved" else "",
+                "ChapLab App Creator & Administrator" if approval_status=="Approved" else ""
+            )
         )
-    )
-    c.execute(
-        """INSERT INTO staff_login_activity(staff_email,logged_in_at,event_type,details)
-           VALUES (?,?,?,?)""",
-        (email,now,"Account Created","Manually added by ChapLab App Creator & Administrator")
-    )
-    c.commit(); c.close()
-    return True,(
-        f"{display_name} was added. "
-        + ("They can use the initial access code to set up their password." if approval_status=="Approved"
-           else "Their account is pending approval.")
-    )
+
+        c.execute(
+            """INSERT INTO staff_login_activity(
+               staff_email,logged_in_at,event_type,details)
+               VALUES (?,?,?,?)""",
+            (
+                email,
+                now,
+                "Account Created",
+                "Manually added by ChapLab App Creator & Administrator"
+            )
+        )
+
+        c.commit()
+        c.close()
+
+        return True,(
+            f"{display_name} was added. "
+            + (
+                "They can use the initial access code to set up their password."
+                if approval_status=="Approved"
+                else "Their account is pending approval."
+            )
+        )
+
+    except sqlite3.Error as e:
+        try:
+            c.rollback()
+            c.close()
+        except Exception:
+            pass
+        return False,f"ChapLab could not save this account: {e}"
 
 def all_staff_accounts_df():
     c=conn()
