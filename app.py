@@ -1,3 +1,6 @@
+import hashlib
+import secrets
+import hmac
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -128,41 +131,139 @@ def cloud_configured():
 def require_login():
     auth=auth_config()
     if cloud_configured() and not auth:
-        st.error("ChapLab Web is connected to cloud storage, but login credentials are missing.")
+        st.error("ChapLab Web is connected to cloud storage, but Creator login credentials are missing.")
         st.info("Add a [chaplab_auth] section to Streamlit Secrets before using student data online.")
         st.stop()
 
-    # Local mode remains available without a login.
     if not auth:
         return
 
+    # Enforce a required staff password setup before normal app use.
+    if st.session_state.get("chaplab_staff_password_setup"):
+        email=str(st.session_state.get("chaplab_staff_email") or "").strip().lower()
+        allowed,msg=staff_account_can_login(email)
+        if not allowed:
+            for k in ("chaplab_authenticated","chaplab_username","chaplab_staff_email","chaplab_staff_password_setup"):
+                st.session_state.pop(k,None)
+            st.error(msg)
+            st.stop()
+
+        st.markdown("## 🔐 Create Your ChapLab Password")
+        st.write(f"Account: **{email}**")
+        st.info(
+            "Your initial access code worked. Before continuing, create your own ChapLab password. "
+            "After you save it, the shared access code will no longer work for your account."
+        )
+        with st.form("staff_create_password_form"):
+            p1=st.text_input("Create password",type="password")
+            p2=st.text_input("Confirm password",type="password")
+            save_password=st.form_submit_button("Save My Password",use_container_width=True,type="primary")
+
+        if save_password:
+            if len(str(p1 or ""))<8:
+                st.error("Choose a password with at least 8 characters.")
+            elif p1!=p2:
+                st.error("The passwords do not match.")
+            elif str(p1 or "").strip().lower()==INITIAL_STAFF_ACCESS_CODE:
+                st.error("Choose a personal password instead of the initial access code.")
+            else:
+                set_staff_password(email,p1)
+                st.session_state.pop("chaplab_staff_password_setup",None)
+                st.session_state["chaplab_authenticated"]=True
+                record_staff_login(email)
+                st.success("Password created. Opening ChapLab…")
+                st.rerun()
+        st.stop()
+
+    # Re-check active staff accounts on every rerun.
     if st.session_state.get("chaplab_authenticated"):
-        if not st.session_state.get("chaplab_username") and auth:
+        staff_email=str(st.session_state.get("chaplab_staff_email") or "").strip().lower()
+        if staff_email:
+            allowed,msg=staff_account_can_login(staff_email)
+            if not allowed:
+                for k in ("chaplab_authenticated","chaplab_username","chaplab_staff_email","chaplab_staff_display_name"):
+                    st.session_state.pop(k,None)
+                st.error(msg)
+                st.stop()
+            # If Creator reset the account while user was signed in, require setup next.
+            if staff_needs_password_setup(staff_email):
+                st.session_state["chaplab_authenticated"]=False
+                st.session_state["chaplab_staff_password_setup"]=True
+                st.rerun()
+            touch_staff_last_seen(staff_email)
+        elif not st.session_state.get("chaplab_username"):
             st.session_state["chaplab_username"]=auth.get("username","teacher")
         return
 
     st.markdown("## 📘 ChapLab Teacher Hub")
-    st.caption("Private teacher sign-in")
+    st.caption("Private school staff sign-in")
+    st.caption(
+        "Staff: use your **79.…@nhaschools.com** email. "
+        "First-time approved users sign in with access code **bscs**."
+    )
+
     with st.form("chaplab_login"):
-        username=st.text_input("Username")
-        password=st.text_input("Password",type="password")
+        username=st.text_input("School email / Creator username")
+        password=st.text_input("Password / Initial access code",type="password")
         submitted=st.form_submit_button("Sign In",use_container_width=True)
+
     if submitted:
-        entered_username=str(username or "").strip()
-        valid_usernames={
-            str(auth.get("username","")).strip(),
-            str(auth.get("recovery_username","")).strip()
-        }
-        valid_usernames.discard("")
-        if entered_username in valid_usernames and password==auth["password"]:
+        entered=str(username or "").strip()
+        entered_lower=entered.lower()
+        recovery_user=str(auth.get("recovery_username","")).strip()
+        everyday_creator=str(auth.get("username","")).strip()
+
+        # Creator login stays separate and uses Streamlit Secrets.
+        creator_login=entered in {recovery_user,everyday_creator}
+        if creator_login and password==auth["password"]:
             st.session_state["chaplab_authenticated"]=True
-            # Always use the current everyday username inside ChapLab, even if
-            # Creator used the recovery username to sign in.
-            st.session_state["chaplab_username"]=str(auth.get("username") or entered_username).strip()
+            st.session_state["chaplab_username"]=everyday_creator or entered
+            st.session_state.pop("chaplab_staff_email",None)
+            st.session_state["_just_logged_in"]=True
+            st.rerun()
+
+        if not valid_school_staff_email(entered_lower):
+            st.error(
+                "School staff must sign in with an NHA email that starts with **79.** "
+                "and ends with **@nhaschools.com**."
+            )
+            st.stop()
+
+        allowed,msg=staff_account_can_login(entered_lower)
+        if not allowed:
+            st.error(msg)
+            st.stop()
+
+        account=staff_account_by_email(entered_lower)
+
+        # First login / Creator reset: shared access code is accepted case-insensitively.
+        if staff_needs_password_setup(entered_lower):
+            if initial_access_code_matches(password):
+                st.session_state["chaplab_username"]=entered_lower
+                st.session_state["chaplab_staff_email"]=entered_lower
+                if account and account["display_name"]:
+                    st.session_state["chaplab_staff_display_name"]=account["display_name"]
+                st.session_state["chaplab_staff_password_setup"]=True
+                st.rerun()
+            else:
+                st.error(
+                    "This account still needs password setup. "
+                    "Use the initial access code provided by the ChapLab App Creator & Administrator."
+                )
+            st.stop()
+
+        # Normal returning staff login: individual password only.
+        if verify_staff_password(account,password):
+            st.session_state["chaplab_authenticated"]=True
+            st.session_state["chaplab_username"]=entered_lower
+            st.session_state["chaplab_staff_email"]=entered_lower
+            if account and account["display_name"]:
+                st.session_state["chaplab_staff_display_name"]=account["display_name"]
+            record_staff_login(entered_lower)
             st.session_state["_just_logged_in"]=True
             st.rerun()
         else:
-            st.error("Username or password is incorrect.")
+            st.error("Email or password is incorrect.")
     st.stop()
 
 require_login()
@@ -640,6 +741,13 @@ def init_db():
         approved_at TEXT DEFAULT '',
         approved_by TEXT DEFAULT ''
     );
+    CREATE TABLE IF NOT EXISTS staff_login_activity(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        staff_email TEXT NOT NULL,
+        logged_in_at TEXT NOT NULL,
+        event_type TEXT DEFAULT 'Login',
+        details TEXT DEFAULT ''
+    );
     CREATE TABLE IF NOT EXISTS staff_role_assignments(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         grade_band TEXT NOT NULL,
@@ -992,6 +1100,334 @@ def seed():
 
 
 init_db(); seed()
+
+# ---------- Staff Account Security / Activity ----------
+def valid_school_staff_email(email):
+    """Only school staff emails beginning with 79. and ending @nhaschools.com are eligible."""
+    email=str(email or "").strip().lower()
+    return bool(re.fullmatch(r"79\.[a-z0-9._%+\-]+@nhaschools\.com",email))
+
+def ensure_staff_account_columns():
+    c=conn()
+    cols={r["name"] for r in c.execute("PRAGMA table_info(staff_accounts)").fetchall()}
+    migrations={
+        "last_login":"TEXT DEFAULT ''",
+        "last_seen":"TEXT DEFAULT ''",
+        "login_count":"INTEGER DEFAULT 0",
+        "deactivated_at":"TEXT DEFAULT ''",
+        "deactivated_by":"TEXT DEFAULT ''",
+        "deactivation_reason":"TEXT DEFAULT ''",
+        "password_hash":"TEXT DEFAULT ''",
+        "password_salt":"TEXT DEFAULT ''",
+        "password_set_at":"TEXT DEFAULT ''",
+        "password_setup_required":"INTEGER DEFAULT 1",
+        "password_reset_at":"TEXT DEFAULT ''",
+        "password_reset_by":"TEXT DEFAULT ''",
+    }
+    for name,definition in migrations.items():
+        if name not in cols:
+            c.execute(f"ALTER TABLE staff_accounts ADD COLUMN {name} {definition}")
+    c.commit(); c.close()
+
+def staff_account_by_email(email):
+    email=str(email or "").strip().lower()
+    c=conn()
+    r=c.execute(
+        "SELECT * FROM staff_accounts WHERE lower(email)=lower(?) LIMIT 1",
+        (email,)
+    ).fetchone()
+    c.close()
+    return r
+
+def staff_account_can_login(email):
+    email=str(email or "").strip().lower()
+    if not valid_school_staff_email(email):
+        return False,"School staff email must start with 79. and end with @nhaschools.com."
+    r=staff_account_by_email(email)
+    if not r:
+        return False,"This staff email is not registered in ChapLab yet."
+    if str(r["approval_status"] or "").strip()!="Approved":
+        return False,"This account is waiting for approval."
+    if not bool(r["active"]):
+        return False,"This ChapLab account has been deactivated."
+    return True,""
+
+def record_staff_login(email):
+    email=str(email or "").strip().lower()
+    if not email:
+        return
+    now=datetime.now().isoformat(timespec="seconds")
+    c=conn()
+    c.execute(
+        """UPDATE staff_accounts
+           SET last_login=?,last_seen=?,login_count=COALESCE(login_count,0)+1
+           WHERE lower(email)=lower(?)""",
+        (now,now,email)
+    )
+    c.execute(
+        """INSERT INTO staff_login_activity(staff_email,logged_in_at,event_type,details)
+           VALUES (?,?,?,?)""",
+        (email,now,"Login","Successful ChapLab sign-in")
+    )
+    c.commit(); c.close()
+
+def touch_staff_last_seen(email):
+    email=str(email or "").strip().lower()
+    if not email:
+        return
+    c=conn()
+    c.execute(
+        "UPDATE staff_accounts SET last_seen=? WHERE lower(email)=lower(?)",
+        (datetime.now().isoformat(timespec="seconds"),email)
+    )
+    c.commit(); c.close()
+
+def all_staff_accounts_df():
+    c=conn()
+    df=pd.read_sql_query(
+        """SELECT id,email,display_name,role_type,grade_band,subjects,
+                  approval_status,active,created_at,approved_at,approved_by,
+                  COALESCE(last_login,'') last_login,
+                  COALESCE(last_seen,'') last_seen,
+                  COALESCE(login_count,0) login_count,
+                  COALESCE(deactivated_at,'') deactivated_at,
+                  COALESCE(deactivated_by,'') deactivated_by,
+                  COALESCE(deactivation_reason,'') deactivation_reason,
+                  COALESCE(password_set_at,'') password_set_at,
+                  COALESCE(password_setup_required,1) password_setup_required,
+                  COALESCE(password_reset_at,'') password_reset_at
+           FROM staff_accounts
+           ORDER BY active DESC,approval_status,display_name,email""",
+        c
+    )
+    c.close()
+    return df
+
+def set_staff_account_active(email,active,reason=""):
+    email=str(email or "").strip().lower()
+    c=conn()
+    if active:
+        c.execute(
+            """UPDATE staff_accounts
+               SET active=1,deactivated_at='',deactivated_by='',deactivation_reason=''
+               WHERE lower(email)=lower(?)""",
+            (email,)
+        )
+    else:
+        now=datetime.now().isoformat(timespec="seconds")
+        c.execute(
+            """UPDATE staff_accounts
+               SET active=0,deactivated_at=?,deactivated_by=?,deactivation_reason=?
+               WHERE lower(email)=lower(?)""",
+            (now,"ChapLab App Creator & Administrator",str(reason or "").strip(),email)
+        )
+        c.execute(
+            """INSERT INTO staff_login_activity(staff_email,logged_in_at,event_type,details)
+               VALUES (?,?,?,?)""",
+            (email,now,"Deactivated",str(reason or "").strip())
+        )
+    c.commit(); c.close()
+
+def set_staff_approval(email,status):
+    email=str(email or "").strip().lower()
+    if status=="Approved" and not valid_school_staff_email(email):
+        return False
+    now=datetime.now().isoformat(timespec="seconds")
+    c=conn()
+    c.execute(
+        """UPDATE staff_accounts SET approval_status=?,
+           approved_at=CASE WHEN ?='Approved' THEN ? ELSE approved_at END,
+           approved_by=CASE WHEN ?='Approved' THEN 'ChapLab App Creator & Administrator' ELSE approved_by END
+           WHERE lower(email)=lower(?)""",
+        (status,status,now,status,email)
+    )
+    c.commit(); c.close()
+    return True
+
+ensure_staff_account_columns()
+
+INITIAL_STAFF_ACCESS_CODE="bscs"
+
+def _password_hash(password,salt_hex=None):
+    """
+    PBKDF2-HMAC-SHA256 password hashing using stdlib only.
+    Returns (salt_hex, digest_hex).
+    """
+    password=str(password or "")
+    if salt_hex:
+        salt=bytes.fromhex(salt_hex)
+    else:
+        salt=secrets.token_bytes(16)
+        salt_hex=salt.hex()
+    digest=hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        240000
+    )
+    return salt_hex,digest.hex()
+
+def staff_password_is_set(account):
+    if not account:
+        return False
+    try:
+        return bool(str(account["password_hash"] or "").strip()) and not bool(account["password_setup_required"])
+    except Exception:
+        return False
+
+def verify_staff_password(account,password):
+    if not account or not staff_password_is_set(account):
+        return False
+    try:
+        salt=str(account["password_salt"] or "")
+        expected=str(account["password_hash"] or "")
+        _,actual=_password_hash(str(password or ""),salt)
+        return hmac.compare_digest(actual,expected)
+    except Exception:
+        return False
+
+def set_staff_password(email,new_password):
+    email=str(email or "").strip().lower()
+    salt,digest=_password_hash(new_password)
+    now=datetime.now().isoformat(timespec="seconds")
+    c=conn()
+    c.execute(
+        """UPDATE staff_accounts
+           SET password_hash=?,password_salt=?,password_set_at=?,
+               password_setup_required=0,password_reset_at='',password_reset_by=''
+           WHERE lower(email)=lower(?)""",
+        (digest,salt,now,email)
+    )
+    c.commit(); c.close()
+
+def reset_staff_password_setup(email):
+    """
+    Creator reset: removes the staff password and returns the account to the
+    one-time access-code setup flow.
+    """
+    email=str(email or "").strip().lower()
+    now=datetime.now().isoformat(timespec="seconds")
+    c=conn()
+    c.execute(
+        """UPDATE staff_accounts
+           SET password_hash='',password_salt='',password_set_at='',
+               password_setup_required=1,password_reset_at=?,
+               password_reset_by='ChapLab App Creator & Administrator'
+           WHERE lower(email)=lower(?)""",
+        (now,email)
+    )
+    c.execute(
+        """INSERT INTO staff_login_activity(staff_email,logged_in_at,event_type,details)
+           VALUES (?,?,?,?)""",
+        (email,now,"Password Reset","Returned to initial access-code setup")
+    )
+    c.commit(); c.close()
+
+def staff_needs_password_setup(email):
+    r=staff_account_by_email(email)
+    if not r:
+        return False
+    try:
+        return bool(r["password_setup_required"]) or not bool(str(r["password_hash"] or "").strip())
+    except Exception:
+        return True
+
+def initial_access_code_matches(value):
+    return str(value or "").strip().lower()==INITIAL_STAFF_ACCESS_CODE
+
+# ---------- Initial Grade 3 Pilot Team ----------
+GRADE3_PILOT_TEACHERS=[
+    {
+        "email":"79.jschroeder@nhaschools.com",
+        "display_name":"Jonathan Schroeder",
+        "role_type":"Teacher",
+        "grade_band":"Grade 3",
+        "subjects":[]
+    },
+    {
+        "email":"79.ncampbell@nhaschools.com",
+        "display_name":"Nicole Campbell",
+        "role_type":"Teacher",
+        "grade_band":"Grade 3",
+        "subjects":[]
+    },
+    {
+        "email":"79.adavidson@nhaschools.com",
+        "display_name":"Ania Davidson",
+        "role_type":"Teacher",
+        "grade_band":"Grade 3",
+        "subjects":[]
+    },
+]
+
+def ensure_grade3_pilot_team():
+    """
+    Pre-approve the initial Grade 3 pilot teachers.
+    This does not assign Grade Team Leader or Newsletter Lead.
+    Subjects remain blank until each teacher completes/edits their profile.
+    """
+    c=conn()
+    now=datetime.now().isoformat(timespec="minutes")
+    for teacher in GRADE3_PILOT_TEACHERS:
+        email=teacher["email"].strip().lower()
+        if not valid_school_staff_email(email):
+            continue
+        existing=c.execute(
+            "SELECT id FROM staff_accounts WHERE lower(email)=lower(?) LIMIT 1",
+            (email,)
+        ).fetchone()
+
+        values=(
+            teacher["display_name"],
+            teacher["role_type"],
+            teacher["grade_band"],
+            json.dumps(teacher["subjects"]),
+            "Approved",
+            1,
+            now,
+            "ChapLab App Creator & Administrator",
+        )
+
+        if existing:
+            c.execute(
+                """UPDATE staff_accounts
+                   SET display_name=?,role_type=?,grade_band=?,subjects=?,
+                       approval_status=?,active=?,approved_at=?,
+                       approved_by=?
+                   WHERE id=?""",
+                values+(int(existing["id"]),)
+            )
+        else:
+            c.execute(
+                """INSERT INTO staff_accounts(
+                   email,display_name,role_type,grade_band,subjects,
+                   approval_status,active,created_at,approved_at,approved_by)
+                   VALUES (?,?,?,?,?,'Approved',1,?,?,?)""",
+                (
+                    email,
+                    teacher["display_name"],
+                    teacher["role_type"],
+                    teacher["grade_band"],
+                    json.dumps(teacher["subjects"]),
+                    now,
+                    now,
+                    "ChapLab App Creator & Administrator",
+                )
+            )
+
+    # Move staff-account testing to the Grade Team stage without releasing
+    # unfinished Dean or wider school features.
+    c.execute(
+        """INSERT OR REPLACE INTO feature_rollout(
+           feature_key,enabled,rollout_stage,updated_at,updated_by)
+           VALUES ('self_signup',1,'Creator + Grade Team',?,?)""",
+        (now,"ChapLab App Creator & Administrator")
+    )
+    c.commit()
+    c.close()
+
+ensure_grade3_pilot_team()
+
 
 # ---------- Username Setup / Change Requests ----------
 def _username_clean(value):
@@ -4598,6 +5034,115 @@ with st.container(border=True):
 
         if is_creator_account():
             st.markdown("---")
+            st.markdown("#### 👤 Account Management")
+            st.caption(
+                "View everyone registered for ChapLab, confirm who is active, see recent sign-in activity, "
+                "and deactivate accounts that should no longer have access."
+            )
+            st.info(
+                "School staff accounts must use an email beginning with **79.** and ending with "
+                "**@nhaschools.com**. After approval, first-time staff use the case-insensitive access code "
+                "**bscs** to enter password setup. Once their personal password is created, the access code stops "
+                "working for that account. The ChapLab App Creator & Administrator recovery login is the only exception."
+            )
+
+            _accounts=all_staff_accounts_df()
+            if _accounts.empty:
+                st.caption("No staff accounts are registered yet.")
+            else:
+                _display=_accounts[[
+                    "display_name","email","role_type","grade_band",
+                    "approval_status","active","password_setup_required",
+                    "last_login","last_seen","login_count"
+                ]].copy()
+                _display["password_setup_required"]=_display["password_setup_required"].apply(
+                    lambda x:"Needs Setup" if bool(x) else "Password Set"
+                )
+                _display.columns=[
+                    "Name","Email","Role","Grade/Team","Approval",
+                    "Active","Password","Last Login","Last Seen","Logins"
+                ]
+                st.dataframe(_display,use_container_width=True,hide_index=True)
+
+                _account_emails=list(_accounts["email"])
+                _manage_email=st.selectbox(
+                    "Manage account",
+                    _account_emails,
+                    format_func=lambda e:(
+                        f"{_accounts[_accounts.email==e].iloc[0]['display_name']} — {e}"
+                    ),
+                    key="creator_manage_staff_account"
+                )
+                _row=_accounts[_accounts.email==_manage_email].iloc[0]
+
+                am1,am2,am3=st.columns(3)
+                am1.metric("Status","Active" if bool(_row["active"]) else "Deactivated")
+                am2.metric("Approval",str(_row["approval_status"]))
+                am3.metric("Login count",int(_row["login_count"] or 0))
+
+                if not valid_school_staff_email(_manage_email):
+                    st.error(
+                        "⚠️ This staff account does not match the required school email format "
+                        "`79.…@nhaschools.com`. It should not be approved for staff access."
+                    )
+
+                _reason=st.text_input(
+                    "Deactivation / account note (optional)",
+                    key="creator_account_action_reason"
+                )
+                ac1,ac2,ac3,ac4=st.columns(4)
+
+                if bool(_row["active"]):
+                    if ac1.button("🚫 Deactivate Account",key="creator_deactivate_account",use_container_width=True):
+                        set_staff_account_active(_manage_email,False,_reason)
+                        st.success(f"{_manage_email} has been deactivated.")
+                        st.rerun()
+                else:
+                    if ac1.button("✅ Reactivate Account",key="creator_reactivate_account",use_container_width=True):
+                        if valid_school_staff_email(_manage_email):
+                            set_staff_account_active(_manage_email,True,_reason)
+                            st.success(f"{_manage_email} has been reactivated.")
+                            st.rerun()
+                        else:
+                            st.error("This email does not meet the required 79.* NHA school format.")
+
+                if str(_row["approval_status"])!="Approved":
+                    if ac2.button("Approve Account",key="creator_approve_account",use_container_width=True):
+                        if set_staff_approval(_manage_email,"Approved"):
+                            st.success("Account approved.")
+                            st.rerun()
+                        else:
+                            st.error("Only valid 79.*@nhaschools.com staff emails can be approved.")
+                else:
+                    if ac2.button("Set to Pending",key="creator_pending_account",use_container_width=True):
+                        set_staff_approval(_manage_email,"Pending")
+                        st.success("Account moved to Pending.")
+                        st.rerun()
+
+                if ac3.button("🔑 Reset Password Setup",key="creator_reset_password_setup",use_container_width=True):
+                    reset_staff_password_setup(_manage_email)
+                    st.success(
+                        f"{_manage_email} can now sign in with the initial access code and create a new password."
+                    )
+                    st.rerun()
+
+                if ac4.button("Refresh Account List",key="creator_refresh_accounts",use_container_width=True):
+                    st.rerun()
+
+                with st.expander("Recent account activity"):
+                    c=conn()
+                    _activity=pd.read_sql_query(
+                        """SELECT staff_email,logged_in_at,event_type,details
+                           FROM staff_login_activity
+                           ORDER BY id DESC LIMIT 50""",c
+                    )
+                    c.close()
+                    if _activity.empty:
+                        st.caption("No staff login activity recorded yet.")
+                    else:
+                        st.dataframe(_activity,use_container_width=True,hide_index=True)
+
+            st.markdown("---")
             st.markdown("#### 🔐 Creator Rollout Controls")
             st.caption("Keep unfinished roles/features hidden until you move them through testing.")
 
@@ -4701,6 +5246,22 @@ with st.container(border=True):
                     "Demo contains 3 fake scholars, 4 assignments across ELA/Math/Science/Social Studies, "
                     "sample grades, and sample reading/assessment data."
                 )
+
+            st.markdown("---")
+            st.markdown("#### 🧪 Grade 3 Pilot Team")
+            st.caption(
+                "These teachers are pre-approved for the Grade 3 testing stage. "
+                "No Grade Team Leader or Newsletter Lead has been assigned yet."
+            )
+            _pilot=approved_staff_df()
+            if not _pilot.empty:
+                _pilot=_pilot[_pilot["email"].str.lower().isin([
+                    "79.jschroeder@nhaschools.com",
+                    "79.ncampbell@nhaschools.com",
+                    "79.adavidson@nhaschools.com",
+                ])]
+                for _,_p in _pilot.iterrows():
+                    st.write(f"✅ **{_p['display_name']}** — {_p['email']} — Grade 3 Teacher")
 
             st.markdown("---")
             st.markdown("#### 👥 Team & Role Management")
