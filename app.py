@@ -268,6 +268,7 @@ def creator_add_staff_account(email,display_name,role_type="Teacher",grade_band=
 
         c.commit()
         c.close()
+        persist_database_now()
 
         return True,(
             f"{display_name} was added. "
@@ -285,6 +286,97 @@ def creator_add_staff_account(email,display_name,role_type="Teacher",grade_band=
         except Exception:
             pass
         return False,f"ChapLab could not save this account: {e}"
+
+def creator_update_staff_account(original_email,new_email,display_name,role_type,grade_band,subjects=None):
+    """Creator/Admin corrects an existing staff account without recreating it."""
+    original_email=str(original_email or "").strip().lower()
+    new_email=str(new_email or "").strip().lower()
+    display_name=str(display_name or "").strip()
+    role_type=str(role_type or "Teacher").strip()
+    grade_band=str(grade_band or "").strip()
+    subjects=subjects or []
+
+    if not display_name:
+        return False,"Enter the staff member's name."
+    if not valid_school_staff_email(new_email):
+        return False,"Email must start with 79. and end with @nhaschools.com."
+
+    c=conn()
+    try:
+        row=c.execute(
+            "SELECT id FROM staff_accounts WHERE lower(email)=lower(?) LIMIT 1",
+            (original_email,)
+        ).fetchone()
+        if not row:
+            c.close()
+            return False,"That staff account could not be found."
+
+        duplicate=c.execute(
+            """SELECT id FROM staff_accounts
+               WHERE lower(email)=lower(?) AND lower(email)<>lower(?) LIMIT 1""",
+            (new_email,original_email)
+        ).fetchone()
+        if duplicate:
+            c.close()
+            return False,"Another ChapLab account already uses that school email."
+
+        now=datetime.now().isoformat(timespec="seconds")
+
+        c.execute(
+            """UPDATE staff_accounts
+               SET email=?,display_name=?,role_type=?,grade_band=?,subjects=?
+               WHERE lower(email)=lower(?)""",
+            (
+                new_email,
+                display_name,
+                role_type,
+                grade_band,
+                json.dumps(subjects),
+                original_email
+            )
+        )
+
+        # Update places that use staff email as an account reference.
+        c.execute(
+            """UPDATE staff_role_assignments
+               SET staff_email=?,staff_name=?
+               WHERE lower(staff_email)=lower(?)""",
+            (new_email,display_name,original_email)
+        )
+        c.execute(
+            """UPDATE staff_login_activity
+               SET staff_email=?
+               WHERE lower(staff_email)=lower(?)""",
+            (new_email,original_email)
+        )
+
+        c.execute(
+            """INSERT INTO staff_login_activity(
+               staff_email,logged_in_at,event_type,details)
+               VALUES (?,?,?,?)""",
+            (
+                new_email,
+                now,
+                "Account Edited",
+                f"Account details corrected by ChapLab App Creator & Administrator. Previous email: {original_email}"
+            )
+        )
+
+        c.commit()
+        c.close()
+
+        cloud_ok=persist_database_now()
+        msg=f"{display_name}'s account was updated."
+        if not cloud_ok:
+            msg+=" The change is saved locally, but cloud sync needs attention."
+        return True,msg
+
+    except sqlite3.Error as e:
+        try:
+            c.rollback(); c.close()
+        except Exception:
+            pass
+        return False,f"ChapLab could not update this account: {e}"
 
 def all_staff_accounts_df():
     c=conn()
@@ -331,6 +423,7 @@ def set_staff_account_active(email,active,reason=""):
             (email,now,"Deactivated",str(reason or "").strip())
         )
     c.commit(); c.close()
+    persist_database_now()
 
 def set_staff_approval(email,status):
     email=str(email or "").strip().lower()
@@ -346,6 +439,7 @@ def set_staff_approval(email,status):
         (status,status,now,status,email)
     )
     c.commit(); c.close()
+    persist_database_now()
     return True
 
 INITIAL_STAFF_ACCESS_CODE="bscs"
@@ -401,6 +495,7 @@ def set_staff_password(email,new_password):
         (digest,salt,now,email)
     )
     c.commit(); c.close()
+    persist_database_now()
 
 def reset_staff_password_setup(email):
     """
@@ -424,6 +519,7 @@ def reset_staff_password_setup(email):
         (email,now,"Password Reset","Returned to initial access-code setup")
     )
     c.commit(); c.close()
+    persist_database_now()
 
 def staff_needs_password_setup(email):
     r=staff_account_by_email(email)
@@ -437,6 +533,19 @@ def staff_needs_password_setup(email):
 def initial_access_code_matches(value):
     return str(value or "").strip().lower()==INITIAL_STAFF_ACCESS_CODE
 
+
+def chaplab_sign_out():
+    """Clear ChapLab authentication/session identity and return to login."""
+    for key in (
+        "chaplab_authenticated",
+        "chaplab_username",
+        "chaplab_staff_email",
+        "chaplab_staff_display_name",
+        "chaplab_staff_password_setup",
+        "_just_logged_in",
+    ):
+        st.session_state.pop(key,None)
+    st.rerun()
 
 def require_login():
     auth=auth_config()
@@ -723,18 +832,51 @@ def cloud_download_database(target):
     return True
 
 def prepare_database():
-    """Open ChapLab immediately. Cloud is never contacted during startup."""
+    """
+    Prepare ChapLab's working database.
+
+    Streamlit Cloud can erase the temporary filesystem during reboot/redeploy.
+    If the temp DB is missing, restore the newest private cloud copy first.
+    Only fall back to the bundled legacy DB when no cloud database is available.
+    """
     if WEB_DB.exists():
         return str(WEB_DB)
+
+    if cloud_configured():
+        try:
+            if cloud_download_database(WEB_DB):
+                return str(WEB_DB)
+        except Exception as e:
+            st.session_state["_cloud_sync_error"]=f"Cloud database restore failed: {e}"
+
     if LEGACY_DB.exists():
         try:
             shutil.copy2(LEGACY_DB,WEB_DB)
             return str(WEB_DB)
         except Exception:
             return str(LEGACY_DB)
+
     return str(WEB_DB)
 
 DB = prepare_database()
+
+def persist_database_now():
+    """
+    Save the current SQLite database to private cloud storage immediately.
+    Returns True when cloud is not configured (local mode) or upload succeeds.
+    """
+    if not cloud_configured():
+        return True
+    try:
+        ok=cloud_upload_file(DB)
+        if ok:
+            st.session_state.pop("_cloud_sync_error",None)
+            return True
+        st.session_state["_cloud_sync_error"]="Database change saved locally, but cloud upload did not complete."
+        return False
+    except Exception as e:
+        st.session_state["_cloud_sync_error"]=f"Database cloud save failed: {e}"
+        return False
 
 def cloud_status_text():
     if not cloud_configured():
@@ -1507,6 +1649,14 @@ ensure_grade3_pilot_team()
 
 # Login executes only after database/account setup is ready.
 require_login()
+
+# ---------- Global Sign Out ----------
+if st.session_state.get("chaplab_authenticated"):
+    _signout_cols=st.columns([8,1.4])
+    with _signout_cols[1]:
+        if st.button("🚪 Sign Out",key="chaplab_global_signout",use_container_width=True):
+            chaplab_sign_out()
+
 
 
 # ---------- Username Setup / Change Requests ----------
@@ -4989,6 +5139,11 @@ with st.container(border=True):
             st.rerun()
 
         st.markdown("---")
+        st.markdown("#### 🚪 Account")
+        if st.button("Sign Out of ChapLab",key="profile_settings_signout",use_container_width=True):
+            chaplab_sign_out()
+
+        st.markdown("---")
         st.markdown("#### 🔑 Login Username")
         user_state=auth_username_state()
         st.caption(f"Current username: **{user_state['username']}**")
@@ -5172,9 +5327,15 @@ with st.container(border=True):
                         st.error(msg)
 
             st.caption(
-                "View everyone registered for ChapLab, confirm who is active, see recent sign-in activity, "
+                "View everyone registered for ChapLab, correct account information, see recent sign-in activity, "
                 "and deactivate accounts that should no longer have access."
             )
+            if cloud_configured():
+                st.caption("☁️ Staff account changes are saved to ChapLab's private cloud database so they survive app reboots.")
+            else:
+                st.warning(
+                    "ChapLab is currently in Local mode. Local-only account changes can be lost if the hosting environment is rebuilt."
+                )
             st.info(
                 "School staff accounts must use an email beginning with **79.** and ending with "
                 "**@nhaschools.com**. After approval, first-time staff use the case-insensitive access code "
@@ -5210,6 +5371,111 @@ with st.container(border=True):
                     key="creator_manage_staff_account"
                 )
                 _row=_accounts[_accounts.email==_manage_email].iloc[0]
+
+                @st.dialog("Edit Selected Account")
+                def _edit_selected_account_dialog():
+                    _fresh=all_staff_accounts_df()
+                    _match=_fresh[_fresh.email==_manage_email]
+                    if _match.empty:
+                        st.error("This account could not be found.")
+                        return
+
+                    _edit_row=_match.iloc[0]
+                    st.caption(
+                        "Correct the staff member's information. Their password, approval status, "
+                        "activity history, and active/deactivated status stay attached."
+                    )
+
+                    try:
+                        _current_subjects=json.loads(_edit_row["subjects"] or "[]")
+                        if not isinstance(_current_subjects,list):
+                            _current_subjects=[]
+                    except Exception:
+                        _current_subjects=[]
+
+                    _roles=["Teacher","Specials Teacher","Special Education","Interventionist","Dean","Other"]
+                    _current_role=str(_edit_row["role_type"] or "Teacher")
+                    if _current_role not in _roles:
+                        _roles.append(_current_role)
+
+                    _grades=[
+                        "","Kindergarten","Grade 1","Grade 2","Grade 3","Grade 4","Grade 5",
+                        "Middle School","Specials","Special Education","Intervention","Administration","Other"
+                    ]
+                    _current_grade=str(_edit_row["grade_band"] or "")
+                    if _current_grade not in _grades:
+                        _grades.append(_current_grade)
+
+                    _subject_options=[
+                        "ELA","Math","Science","Social Studies","Art","Music","Physical Education",
+                        "Technology","Spanish","Special Education","Intervention","Other"
+                    ]
+                    for _sub in _current_subjects:
+                        if _sub not in _subject_options:
+                            _subject_options.append(_sub)
+
+                    ed1,ed2=st.columns(2)
+                    _edit_name=ed1.text_input(
+                        "Full name",
+                        value=str(_edit_row["display_name"] or ""),
+                        key="dialog_edit_staff_name"
+                    )
+                    _edit_email=ed2.text_input(
+                        "School email",
+                        value=str(_edit_row["email"] or ""),
+                        key="dialog_edit_staff_email"
+                    )
+
+                    ed3,ed4=st.columns(2)
+                    _edit_role=ed3.selectbox(
+                        "Role",
+                        _roles,
+                        index=_roles.index(_current_role),
+                        key="dialog_edit_staff_role"
+                    )
+                    _edit_grade=ed4.selectbox(
+                        "Grade / team",
+                        _grades,
+                        index=_grades.index(_current_grade),
+                        key="dialog_edit_staff_grade"
+                    )
+
+                    _edit_subjects=st.multiselect(
+                        "Subject(s)",
+                        _subject_options,
+                        default=_current_subjects,
+                        key="dialog_edit_staff_subjects"
+                    )
+
+                    if st.button(
+                        "💾 Save Corrections",
+                        type="primary",
+                        use_container_width=True,
+                        key="dialog_save_staff_corrections"
+                    ):
+                        _ok,_msg=creator_update_staff_account(
+                            _manage_email,
+                            _edit_email,
+                            _edit_name,
+                            _edit_role,
+                            _edit_grade,
+                            _edit_subjects
+                        )
+                        if _ok:
+                            st.success(_msg)
+                            st.session_state.pop("creator_manage_staff_account",None)
+                            st.rerun()
+                        else:
+                            st.error(_msg)
+
+                _edit_button_cols=st.columns([2.2,5])
+                with _edit_button_cols[0]:
+                    if st.button(
+                        "✏️ Edit Selected Account",
+                        key="creator_open_edit_selected_account",
+                        use_container_width=True
+                    ):
+                        _edit_selected_account_dialog()
 
                 am1,am2,am3=st.columns(3)
                 am1.metric("Status","Active" if bool(_row["active"]) else "Deactivated")
