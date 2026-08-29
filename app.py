@@ -576,8 +576,6 @@ def require_login():
             st.error("Email or password is incorrect.")
     st.stop()
 
-require_login()
-
 # Lightweight diagnostic marker: if this appears in Streamlit logs,
 # ChapLab passed imports/login setup and entered normal app execution.
 print("ChapLab startup: core app loaded; barcode engine deferred until scan.", flush=True)
@@ -1506,6 +1504,9 @@ def ensure_grade3_pilot_team():
     c.close()
 
 ensure_grade3_pilot_team()
+
+# Login executes only after database/account setup is ready.
+require_login()
 
 
 # ---------- Username Setup / Change Requests ----------
