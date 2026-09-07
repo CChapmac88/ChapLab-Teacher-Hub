@@ -1468,9 +1468,17 @@ def save_setting(k,v):
     c=conn(); c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)",(k,json.dumps(v))); c.commit(); c.close()
 
 GRADE3_REAL_CLASSES = {
-    "3-207": "Ms. Campbell • Grade 3 • Math",
-    "3-208": "Ms. Chapman • Grade 3 • Science & Social Studies",
-    "3-212": "Mr. Schroeder • Grade 3 • ELA",
+    "Class A": "Ms. Campbell + Ms. Davidson • Grade 3",
+    "Class B": "Mr. Schroder • Grade 3",
+    "Class C": "Ms. Chapman • Grade 3",
+}
+
+GRADE3_TEACHER_CLASS_MAP = {
+    "campbell": "Class A",
+    "davidson": "Class A",
+    "schroder": "Class B",
+    "schroeder": "Class B",
+    "chapman": "Class C",
 }
 
 def ensure_grade3_real_classes():
@@ -1502,12 +1510,35 @@ def grade3_roster_counts():
         """SELECT c.class_name,COUNT(s.id) AS scholar_count
            FROM classes c
            LEFT JOIN scholars s ON s.class_id=c.id AND s.active=1 AND COALESCE(s.is_demo,0)=0
-           WHERE c.class_name IN ('3-207','3-208','3-212')
+           WHERE c.class_name IN ('Class A','Class B','Class C')
            GROUP BY c.id,c.class_name
            ORDER BY c.class_name"""
     ).fetchall()
     c.close()
     return {str(r["class_name"]):int(r["scholar_count"] or 0) for r in rows}
+
+def resolve_grade3_class(room_value="", teacher_first="", teacher_last=""):
+    """Map NHA roster room/teacher values into ChapLab Class A/B/C."""
+    room=str(room_value or "").strip()
+    room_norm=norm_header(room)
+
+    direct={
+        "a":"Class A","classa":"Class A","3a":"Class A",
+        "b":"Class B","classb":"Class B","3b":"Class B",
+        "c":"Class C","classc":"Class C","3c":"Class C",
+    }
+    if room_norm in direct:
+        return direct[room_norm]
+
+    teacher=(str(teacher_first or "")+" "+str(teacher_last or "")).strip().lower()
+    for key,class_name in GRADE3_TEACHER_CLASS_MAP.items():
+        if key in teacher:
+            return class_name
+
+    if room in GRADE3_REAL_CLASSES:
+        return room
+
+    return room or "Grade 3 - Class Not Assigned"
 
 def import_nha_student_parent_roster(df, update_existing=True):
     """Import/update the NHA Student And Parent Information export."""
@@ -1538,6 +1569,8 @@ def import_nha_student_parent_roster(df, update_existing=True):
     last_col=col("Student Last Name")
     id_col=col("External Student ID","Student ID")
     room_col=col("Room","Home Room","Homeroom")
+    homeroom_teacher_first_col=col("Home Room Teacher First Name","Homeroom Teacher First Name")
+    homeroom_teacher_last_col=col("Home Room Teacher Last Name","Homeroom Teacher Last Name")
     school_col=col("School Name")
     grade_col=col("Grade Level")
     gender_col=col("Gender")
@@ -1557,7 +1590,8 @@ def import_nha_student_parent_roster(df, update_existing=True):
     if not first_col: missing.append("Student First Name")
     if not last_col: missing.append("Student Last Name")
     if not id_col: missing.append("External Student ID")
-    if not room_col: missing.append("Room")
+    if not room_col and not homeroom_teacher_last_col:
+        missing.append("Room or Home Room Teacher Last Name")
     if missing:
         return {
             "new":0,"updated":0,"guardians":0,"skipped":0,
@@ -1573,12 +1607,14 @@ def import_nha_student_parent_roster(df, update_existing=True):
             last=value(row,last_col)
             student_id=value(row,id_col)
             room=value(row,room_col).strip()
+            homeroom_first=value(row,homeroom_teacher_first_col)
+            homeroom_last=value(row,homeroom_teacher_last_col)
 
             if not first or not last or not student_id:
                 skipped+=1
                 continue
 
-            class_name=room or "Grade 3 - Room Not Assigned"
+            class_name=resolve_grade3_class(room,homeroom_first,homeroom_last)
             cur.execute(
                 """INSERT INTO classes(class_name,subject_note,active,is_demo)
                    VALUES (?,?,1,0)
@@ -3187,6 +3223,7 @@ def recent_assignments_df(limit=5):
     df=pd.read_sql_query("""SELECT a.*,c.class_name
                             FROM assignments a
                             LEFT JOIN classes c ON c.id=a.class_id
+                            WHERE COALESCE(c.is_demo,0)=0
                             ORDER BY COALESCE(a.assignment_date,'') DESC,a.id DESC
                             LIMIT ?""",c,params=[int(limit)])
     c.close()
@@ -5858,7 +5895,7 @@ with st.container(border=True):
             st.markdown("#### ✅ Live Roster Mode")
             st.caption(
                 "Demo Class is OFF. ChapLab is now set up for the live Grade 3 roster "
-                "using homerooms 3-207, 3-208, and 3-212."
+                "using Class A, Class B, and Class C."
             )
 
             st.markdown("---")
@@ -6357,17 +6394,19 @@ elif page=="Scholars":
     st.caption(
         "Upload your NHA **Student And Parent Information** spreadsheet whenever the roster changes. "
         "ChapLab matches scholars by External Student ID, updates their information, and places them "
-        "in the room listed in the spreadsheet."
+        "into Class A, B, or C using the Room or Home Room Teacher fields."
     )
 
     _counts=grade3_roster_counts()
     rc1,rc2,rc3=st.columns(3)
-    rc1.metric("3-207",_counts.get("3-207",0),"Ms. Campbell")
-    rc2.metric("3-208",_counts.get("3-208",0),"Ms. Chapman")
-    rc3.metric("3-212",_counts.get("3-212",0),"Mr. Schroeder")
+    rc1.metric("Class A",_counts.get("Class A",0),"Ms. Campbell + Ms. Davidson")
+    rc2.metric("Class B",_counts.get("Class B",0),"Mr. Schroder")
+    rc3.metric("Class C",_counts.get("Class C",0),"Ms. Chapman")
+
+    st.caption("Class mapping: **A = Campbell + Davidson • B = Schroder • C = Chapman**")
 
     st.info(
-        "All Grade 3 teachers can switch between **3-207, 3-208, and 3-212**. "
+        "All Grade 3 teachers can switch between **Class A, Class B, and Class C**. "
         "Uploading a newer roster updates matching students instead of duplicating them. "
         "Students are never removed just because they are missing from a later upload."
     )
@@ -6387,8 +6426,9 @@ elif page=="Scholars":
 
             if _nha_df.empty:
                 st.warning(
-                    "This spreadsheet has the correct headings but no student rows yet. "
-                    "Upload the populated copy when it is ready."
+                    "ChapLab can read this file, but it contains 0 student rows. "
+                    "It has column headings only, so there are no scholars to import. "
+                    "Download/export the populated Student And Parent Information roster, then upload that copy."
                 )
             else:
                 _needed=["Student First Name","Student Last Name","External Student ID","Room"]
