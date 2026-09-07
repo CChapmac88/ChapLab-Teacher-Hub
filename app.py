@@ -1540,6 +1540,196 @@ def resolve_grade3_class(room_value="", teacher_first="", teacher_last=""):
 
     return room or "Grade 3 - Class Not Assigned"
 
+def normalize_uploaded_roster_dataframe(df):
+    """Promote a later row to headers when an NHA Excel export starts with a blank/title row."""
+    if df is None:
+        return df
+    current={norm_header(c) for c in df.columns}
+    known={
+        "studentfirstname","studentlastname","externalstudentid",
+        "coursesectiongroupname","homeroomadvisoryteacher","schoolname"
+    }
+    if len(current.intersection(known)) >= 2:
+        return df.fillna("")
+
+    # Search the first few data rows for the real header row.
+    for i in range(min(8,len(df))):
+        vals=[norm_header(v) for v in list(df.iloc[i].values)]
+        if ("studentfirstname" in vals and "studentlastname" in vals and
+            ("externalstudentid" in vals or "coursesectiongroupname" in vals)):
+            promoted=df.iloc[i+1:].copy()
+            promoted.columns=[clean(v) if clean(v) else f"Column_{j+1}" for j,v in enumerate(df.iloc[i].values)]
+            promoted=promoted.reset_index(drop=True).fillna("")
+            # Drop completely empty columns introduced by the report formatting.
+            keep=[c for c in promoted.columns if norm_header(c) and not str(c).startswith("Column_")]
+            if keep:
+                promoted=promoted[keep]
+            return promoted
+    return df.fillna("")
+
+def is_nha_student_usernames_export(df):
+    if df is None:
+        return False
+    cols={norm_header(c) for c in df.columns}
+    needed={"studentfirstname","studentlastname","externalstudentid","coursesectiongroupname"}
+    return needed.issubset(cols)
+
+def import_nha_student_usernames_roster(df):
+    """
+    Import the NHA Student Usernames roster.
+    External Student ID becomes the permanent scholar key.
+    Existing name/class profiles from the parent-contact roster are upgraded with the ID.
+    """
+    df=normalize_uploaded_roster_dataframe(df)
+    if df is None or df.empty:
+        return {"error":"This roster contains no student rows."}
+
+    col_by_norm={norm_header(c):c for c in df.columns}
+    def col(*names):
+        for name in names:
+            c=col_by_norm.get(norm_header(name))
+            if c:
+                return c
+        return None
+    def val(row,*names):
+        c=col(*names)
+        if not c:
+            return ""
+        try:
+            return clean(row[c])
+        except Exception:
+            return ""
+
+    first_col=col("Student First Name","StudentFirstName")
+    last_col=col("Student Last Name","StudentLastName")
+    id_col=col("External Student ID","ExternalStudentID")
+    section_col=col("Course Section Group Name","CourseSectionGroupName")
+    teacher_col=col("Homeroom/Advisory Teacher","Homeroom Advisory Teacher")
+    username_col=col("Username")
+    school_col=col("School Name")
+    grade_col=col("Grade Level")
+
+    missing=[]
+    if not first_col: missing.append("Student First Name")
+    if not last_col: missing.append("Student Last Name")
+    if not id_col: missing.append("External Student ID")
+    if not section_col: missing.append("Course Section Group Name")
+    if missing:
+        return {"error":"Missing required Student Usernames column(s): "+", ".join(missing)}
+
+    # The existing scholars table may not yet have username/email columns.
+    c=conn()
+    cols={r["name"] for r in c.execute("PRAGMA table_info(scholars)").fetchall()}
+    if "student_username" not in cols:
+        c.execute("ALTER TABLE scholars ADD COLUMN student_username TEXT DEFAULT ''")
+    c.commit()
+
+    cur=c.cursor()
+    new_count=updated_count=skipped=0
+    class_counts={"Class A":0,"Class B":0,"Class C":0}
+    seen_ids=set()
+
+    try:
+        for _,row in df.fillna("").iterrows():
+            first=clean(row[first_col])
+            last=clean(row[last_col])
+            student_id=clean(row[id_col])
+            section=clean(row[section_col])
+            teacher=clean(row[teacher_col]) if teacher_col else ""
+            if not first or not last or not student_id:
+                skipped+=1
+                continue
+
+            # Prevent duplicate lines in the same report.
+            if student_id in seen_ids:
+                continue
+            seen_ids.add(student_id)
+
+            class_name=class_from_course_section_group(section)
+            if class_name=="Grade 3 - Class Not Assigned":
+                t=teacher.lower()
+                if "campbell" in t or "davidson" in t:
+                    class_name="Class A"
+                elif "schroeder" in t or "schroder" in t:
+                    class_name="Class B"
+                elif "chapman" in t:
+                    class_name="Class C"
+
+            if class_name in class_counts:
+                class_counts[class_name]+=1
+
+            cur.execute(
+                """INSERT INTO classes(class_name,subject_note,active,is_demo)
+                   VALUES (?,?,1,0)
+                   ON CONFLICT(class_name) DO UPDATE SET active=1,is_demo=0""",
+                (class_name,"Live Grade 3 roster")
+            )
+            class_id=int(cur.execute(
+                "SELECT id FROM classes WHERE class_name=?",(class_name,)
+            ).fetchone()["id"])
+
+            # First choice: permanent Student ID.
+            existing=cur.execute(
+                "SELECT * FROM scholars WHERE student_id=? LIMIT 1",
+                (student_id,)
+            ).fetchone()
+
+            # Second choice: upgrade the profile previously created from parent roster.
+            if not existing:
+                existing=cur.execute(
+                    """SELECT * FROM scholars
+                       WHERE lower(trim(first_name))=lower(trim(?))
+                         AND lower(trim(last_name))=lower(trim(?))
+                       ORDER BY CASE WHEN class_id=? THEN 0 ELSE 1 END, id
+                       LIMIT 1""",
+                    (first,last,class_id)
+                ).fetchone()
+
+            school=clean(row[school_col]) if school_col else ""
+            grade=clean(row[grade_col]) if grade_col else "Third Grade"
+            username=clean(row[username_col]) if username_col else ""
+            if existing:
+                scholar_id=int(existing["id"])
+                cur.execute(
+                    """UPDATE scholars SET
+                       first_name=?,last_name=?,class_name=?,class_id=?,
+                       school_name=CASE WHEN ?<>'' THEN ? ELSE school_name END,
+                       grade_level=CASE WHEN ?<>'' THEN ? ELSE grade_level END,
+                       student_id=?,student_username=?,
+                       active=1,is_demo=0
+                       WHERE id=?""",
+                    (first,last,class_name,class_id,
+                     school,school,grade,grade,student_id,username,scholar_id)
+                )
+                updated_count+=1
+            else:
+                cur.execute(
+                    """INSERT INTO scholars(
+                       first_name,last_name,class_name,class_id,school_name,
+                       academic_year,grade_level,student_id,student_username,
+                       active,is_demo)
+                       VALUES (?,?,?,?,?,?,?,?,?,1,0)""",
+                    (first,last,class_name,class_id,school,current_academic_year(),
+                     grade,student_id,username)
+                )
+                new_count+=1
+
+        c.commit()
+    except Exception:
+        c.rollback(); c.close(); raise
+
+    c.close()
+    persist_database_now()
+    return {
+        "new":new_count,"updated":updated_count,"skipped":skipped,
+        "processed":len(seen_ids),"class_counts":class_counts,
+        "message":(
+            f"Student ID roster complete: {len(seen_ids)} scholar(s) processed "
+            f"({new_count} new, {updated_count} updated). "
+            f"External Student ID is now saved as the permanent scholar identifier."
+        )
+    }
+
 def is_nha_parent_address_class_export(df):
     """Detect the actual NHA Student Parent Address Phone by Class export."""
     if df is None:
@@ -1640,11 +1830,6 @@ def import_nha_parent_address_class_roster(df):
             school=val(row,"SchoolName")
             academic_year=val(row,"AcademicYearName") or current_academic_year()
             grade=val(row,"GradeLevelName") or "3"
-            address=val(row,"Address")
-            city=val(row,"City")
-            state=val(row,"StateCode")
-            zip_code=val(row,"ZipCode")
-
             if existing:
                 scholar_id=int(existing["id"])
                 if scholar_key not in seen_scholars:
@@ -1652,22 +1837,20 @@ def import_nha_parent_address_class_roster(df):
                         """UPDATE scholars SET
                            first_name=?,last_name=?,class_name=?,class_id=?,
                            school_name=?,academic_year=?,grade_level=?,
-                           address=?,city=?,state_code=?,zip_code=?,
                            active=1,is_demo=0
                            WHERE id=?""",
                         (first,last,class_name,class_id,school,academic_year,grade,
-                         address,city,state,zip_code,scholar_id)
+                         scholar_id)
                     )
                     updated_count+=1
             else:
                 cur.execute(
                     """INSERT INTO scholars(
                        first_name,last_name,class_name,class_id,school_name,
-                       academic_year,grade_level,address,city,state_code,zip_code,
+                       academic_year,grade_level,
                        active,is_demo)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,1,0)""",
-                    (first,last,class_name,class_id,school,academic_year,grade,
-                     address,city,state,zip_code)
+                       VALUES (?,?,?,?,?,?,?,1,0)""",
+                    (first,last,class_name,class_id,school,academic_year,grade)
                 )
                 scholar_id=int(cur.lastrowid)
                 new_count+=1
@@ -1839,11 +2022,6 @@ def import_nha_student_parent_roster(df, update_existing=True):
             school=value(row,school_col)
             grade=value(row,grade_col) or "3"
             gender=value(row,gender_col)
-            address=value(row,address_col)
-            city=value(row,city_col)
-            state=value(row,state_col)
-            zip_code=value(row,zip_col)
-
             if existing:
                 scholar_id=int(existing["id"])
                 if update_existing:
@@ -1851,12 +2029,11 @@ def import_nha_student_parent_roster(df, update_existing=True):
                         """UPDATE scholars SET
                            first_name=?,last_name=?,class_name=?,class_id=?,
                            school_name=?,academic_year=?,grade_level=?,student_id=?,
-                           address=?,city=?,state_code=?,zip_code=?,gender=?,
-                           active=1,is_demo=0
+                           gender=?,active=1,is_demo=0
                            WHERE id=?""",
                         (
                             first,last,class_name,class_id,school,current_academic_year(),
-                            grade,student_id,address,city,state,zip_code,gender,scholar_id
+                            grade,student_id,gender,scholar_id
                         )
                     )
                     updated_count+=1
@@ -1864,11 +2041,11 @@ def import_nha_student_parent_roster(df, update_existing=True):
                 cur.execute(
                     """INSERT INTO scholars(
                        first_name,last_name,class_name,class_id,school_name,academic_year,
-                       grade_level,student_id,address,city,state_code,zip_code,gender,active,is_demo)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,0)""",
+                       grade_level,student_id,gender,active,is_demo)
+                       VALUES (?,?,?,?,?,?,?,?,?,1,0)""",
                     (
                         first,last,class_name,class_id,school,current_academic_year(),
-                        grade,student_id,address,city,state,zip_code,gender
+                        grade,student_id,gender
                     )
                 )
                 scholar_id=int(cur.lastrowid)
@@ -6592,9 +6769,9 @@ elif page=="Scholars":
 
     st.markdown("### 🏫 Grade 3 Live Roster")
     st.caption(
-        "Upload either NHA Grade 3 roster export whenever the roster changes. "
-        "ChapLab recognizes the Student Parent Address Phone by Class report as well as the "
-        "Student And Parent Information report and places scholars into Class A, B, or C."
+        "Use this same upload box for either NHA roster. **Student Usernames** adds the permanent "
+        "External Student ID, username, and class. **Student Parent Address Phone by Class** "
+        "adds parent/guardian and contact information. ChapLab merges both into the same scholar profile."
     )
 
     _counts=grade3_roster_counts()
@@ -6604,6 +6781,8 @@ elif page=="Scholars":
     rc3.metric("Class C",_counts.get("Class C",0),"Ms. Chapman")
 
     st.caption("Class mapping: **A = Campbell + Davidson • B = Schroder • C = Chapman**")
+    st.info("Best order: **1. Upload Student Usernames.xlsx → 2. Upload the parent/contact roster.** You can re-upload either report later to update the same scholars.")
+    st.caption("Privacy: ChapLab keeps the scholar ID/class information and guardian **phone numbers** needed for school communication. Student home addresses and student email addresses are not imported into the live roster.")
 
     st.info(
         "All Grade 3 teachers can switch between **Class A, Class B, and Class C**. "
@@ -6624,11 +6803,64 @@ elif page=="Scholars":
             else:
                 _nha_df=pd.read_excel(_nha_roster,dtype=str).fillna("")
 
+            _nha_df=normalize_uploaded_roster_dataframe(_nha_df)
+
             if _nha_df.empty:
                 st.warning(
                     "ChapLab can read this file, but it contains 0 student rows. "
                     "It has column headings only, so there are no scholars to import."
                 )
+
+            elif is_nha_student_usernames_export(_nha_df):
+                _unique_ids=_nha_df.drop_duplicates(
+                    subset=[next(c for c in _nha_df.columns if norm_header(c)=="externalstudentid")]
+                )
+                _section_col=next(
+                    c for c in _nha_df.columns if norm_header(c)=="coursesectiongroupname"
+                )
+                _classes=_unique_ids[_section_col].apply(class_from_course_section_group)
+                _counts=_classes.value_counts().to_dict()
+
+                st.success(
+                    f"Recognized NHA Student Usernames roster: "
+                    f"{len(_unique_ids)} unique scholar ID(s)."
+                )
+                i1,i2,i3=st.columns(3)
+                i1.metric("Class A",int(_counts.get("Class A",0)),"Campbell + Davidson")
+                i2.metric("Class B",int(_counts.get("Class B",0)),"Schroeder")
+                i3.metric("Class C",int(_counts.get("Class C",0)),"Chapman")
+
+                _preview_cols=[
+                    c for c in _nha_df.columns
+                    if norm_header(c) in {
+                        "studentfirstname","studentlastname","externalstudentid",
+                        "username","homeroomadvisoryteacher",
+                        "coursesectiongroupname"
+                    }
+                ]
+                st.dataframe(
+                    _unique_ids[_preview_cols].head(20),
+                    use_container_width=True,
+                    hide_index=True
+                )
+                st.caption(
+                    "This is the ID roster. Import it first or anytime it changes. "
+                    "ChapLab saves External Student ID as the permanent scholar identifier "
+                    "and can merge it into profiles created from the parent/contact roster."
+                )
+
+                if st.button(
+                    "🪪 Import Student IDs & Accounts",
+                    type="primary",
+                    use_container_width=True,
+                    key="apply_student_usernames_roster"
+                ):
+                    _result=import_nha_student_usernames_roster(_nha_df)
+                    if _result.get("error"):
+                        st.error(_result["error"])
+                    else:
+                        st.success(_result["message"])
+                        st.rerun()
 
             elif is_nha_parent_address_class_export(_nha_df):
                 _unique_students=_nha_df[
