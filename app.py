@@ -1467,6 +1467,234 @@ def get_setting(k):
 def save_setting(k,v):
     c=conn(); c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES (?,?)",(k,json.dumps(v))); c.commit(); c.close()
 
+GRADE3_REAL_CLASSES = {
+    "3-207": "Ms. Campbell • Grade 3 • Math",
+    "3-208": "Ms. Chapman • Grade 3 • Science & Social Studies",
+    "3-212": "Mr. Schroeder • Grade 3 • ELA",
+}
+
+def ensure_grade3_real_classes():
+    """Keep the three Grade 3 homeroom folders available for the live roster."""
+    c=conn()
+    for class_name,note in GRADE3_REAL_CLASSES.items():
+        c.execute(
+            """INSERT INTO classes(class_name,subject_note,active,is_demo)
+               VALUES (?,?,1,0)
+               ON CONFLICT(class_name) DO UPDATE SET
+                 subject_note=excluded.subject_note,
+                 active=1,
+                 is_demo=0""",
+            (class_name,note)
+        )
+    c.commit(); c.close()
+
+def retire_demo_for_live_roster():
+    """Turn demo mode off and hide demo records without deleting them."""
+    c=conn()
+    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES ('demo_enabled',?)",(json.dumps(False),))
+    c.execute("UPDATE classes SET active=0 WHERE is_demo=1")
+    c.execute("UPDATE scholars SET active=0 WHERE is_demo=1")
+    c.commit(); c.close()
+
+def grade3_roster_counts():
+    c=conn()
+    rows=c.execute(
+        """SELECT c.class_name,COUNT(s.id) AS scholar_count
+           FROM classes c
+           LEFT JOIN scholars s ON s.class_id=c.id AND s.active=1 AND COALESCE(s.is_demo,0)=0
+           WHERE c.class_name IN ('3-207','3-208','3-212')
+           GROUP BY c.id,c.class_name
+           ORDER BY c.class_name"""
+    ).fetchall()
+    c.close()
+    return {str(r["class_name"]):int(r["scholar_count"] or 0) for r in rows}
+
+def import_nha_student_parent_roster(df, update_existing=True):
+    """Import/update the NHA Student And Parent Information export."""
+    if df is None or df.empty:
+        return {
+            "new":0,"updated":0,"guardians":0,"skipped":0,
+            "message":"The spreadsheet has headings but no student rows to import."
+        }
+
+    col_by_norm={norm_header(c):c for c in df.columns}
+
+    def col(*names):
+        for name in names:
+            n=norm_header(name)
+            if n in col_by_norm:
+                return col_by_norm[n]
+        return None
+
+    def value(row,column):
+        if not column:
+            return ""
+        try:
+            return clean(row[column])
+        except Exception:
+            return ""
+
+    first_col=col("Student First Name")
+    last_col=col("Student Last Name")
+    id_col=col("External Student ID","Student ID")
+    room_col=col("Room","Home Room","Homeroom")
+    school_col=col("School Name")
+    grade_col=col("Grade Level")
+    gender_col=col("Gender")
+    address_col=col("Address")
+    city_col=col("City")
+    state_col=col("State")
+    zip_col=col("Zip Code","Zip")
+    guardian_first_col=col("Guardian First Name")
+    guardian_last_col=col("Guardian Last Name")
+    relationship_col=col("Relationship Type","Relationship")
+    home_phone_col=col("Home Phone")
+    work_phone_col=col("Work Phone")
+    cell_phone_col=col("Cell Phone")
+    guardian_email_col=col("Email","Guardian Email","Email Address")
+
+    missing=[]
+    if not first_col: missing.append("Student First Name")
+    if not last_col: missing.append("Student Last Name")
+    if not id_col: missing.append("External Student ID")
+    if not room_col: missing.append("Room")
+    if missing:
+        return {
+            "new":0,"updated":0,"guardians":0,"skipped":0,
+            "error":"Missing required column(s): "+", ".join(missing)
+        }
+
+    c=conn(); cur=c.cursor()
+    new_count=updated_count=guardian_count=skipped=0
+
+    try:
+        for _,row in df.fillna("").iterrows():
+            first=value(row,first_col)
+            last=value(row,last_col)
+            student_id=value(row,id_col)
+            room=value(row,room_col).strip()
+
+            if not first or not last or not student_id:
+                skipped+=1
+                continue
+
+            class_name=room or "Grade 3 - Room Not Assigned"
+            cur.execute(
+                """INSERT INTO classes(class_name,subject_note,active,is_demo)
+                   VALUES (?,?,1,0)
+                   ON CONFLICT(class_name) DO UPDATE SET active=1,is_demo=0""",
+                (class_name,"Imported from NHA Student & Parent Information")
+            )
+            class_id=int(
+                cur.execute(
+                    "SELECT id FROM classes WHERE class_name=?",
+                    (class_name,)
+                ).fetchone()["id"]
+            )
+
+            existing=cur.execute(
+                """SELECT * FROM scholars
+                   WHERE student_id=?
+                     AND TRIM(COALESCE(student_id,''))<>''
+                   LIMIT 1""",
+                (student_id,)
+            ).fetchone()
+
+            school=value(row,school_col)
+            grade=value(row,grade_col) or "3"
+            gender=value(row,gender_col)
+            address=value(row,address_col)
+            city=value(row,city_col)
+            state=value(row,state_col)
+            zip_code=value(row,zip_col)
+
+            if existing:
+                scholar_id=int(existing["id"])
+                if update_existing:
+                    cur.execute(
+                        """UPDATE scholars SET
+                           first_name=?,last_name=?,class_name=?,class_id=?,
+                           school_name=?,academic_year=?,grade_level=?,student_id=?,
+                           address=?,city=?,state_code=?,zip_code=?,gender=?,
+                           active=1,is_demo=0
+                           WHERE id=?""",
+                        (
+                            first,last,class_name,class_id,school,current_academic_year(),
+                            grade,student_id,address,city,state,zip_code,gender,scholar_id
+                        )
+                    )
+                    updated_count+=1
+            else:
+                cur.execute(
+                    """INSERT INTO scholars(
+                       first_name,last_name,class_name,class_id,school_name,academic_year,
+                       grade_level,student_id,address,city,state_code,zip_code,gender,active,is_demo)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,0)""",
+                    (
+                        first,last,class_name,class_id,school,current_academic_year(),
+                        grade,student_id,address,city,state,zip_code,gender
+                    )
+                )
+                scholar_id=int(cur.lastrowid)
+                new_count+=1
+
+            gf=value(row,guardian_first_col)
+            gl=value(row,guardian_last_col)
+            rel=value(row,relationship_col)
+            hp=value(row,home_phone_col)
+            wp=value(row,work_phone_col)
+            cp=value(row,cell_phone_col)
+            em=value(row,guardian_email_col)
+
+            if gf or gl or hp or wp or cp or em:
+                guardian=cur.execute(
+                    """SELECT id FROM guardians
+                       WHERE scholar_id=?
+                         AND lower(COALESCE(first_name,''))=lower(?)
+                         AND lower(COALESCE(last_name,''))=lower(?)
+                         AND lower(COALESCE(relationship,''))=lower(?)
+                       LIMIT 1""",
+                    (scholar_id,gf,gl,rel)
+                ).fetchone()
+
+                if guardian:
+                    cur.execute(
+                        """UPDATE guardians
+                           SET home_phone=?,work_phone=?,cell_phone=?,email=?
+                           WHERE id=?""",
+                        (hp,wp,cp,em,int(guardian["id"]))
+                    )
+                else:
+                    cur.execute(
+                        """INSERT INTO guardians(
+                           scholar_id,first_name,last_name,relationship,
+                           home_phone,work_phone,cell_phone,email)
+                           VALUES (?,?,?,?,?,?,?,?)""",
+                        (scholar_id,gf,gl,rel,hp,wp,cp,em)
+                    )
+                guardian_count+=1
+
+        c.commit()
+    except Exception:
+        c.rollback()
+        c.close()
+        raise
+
+    c.close()
+    persist_database_now()
+    return {
+        "new":new_count,
+        "updated":updated_count,
+        "guardians":guardian_count,
+        "skipped":skipped,
+        "message":(
+            f"Roster update complete: {new_count} new scholar(s), "
+            f"{updated_count} existing scholar profile(s) updated, "
+            f"{guardian_count} parent/guardian row(s) processed, "
+            f"{skipped} row(s) skipped."
+        )
+    }
+
 def classes_df(active=True):
     c=conn(); q="SELECT * FROM classes"+(" WHERE active=1" if active else "")+" ORDER BY class_name"
     df=pd.read_sql_query(q,c); c.close(); return df
@@ -1646,6 +1874,10 @@ def ensure_grade3_pilot_team():
     c.close()
 
 ensure_grade3_pilot_team()
+
+# Live Grade 3 rollout: real homerooms are ready and demo data is hidden.
+ensure_grade3_real_classes()
+retire_demo_for_live_roster()
 
 # Login executes only after database/account setup is ready.
 require_login()
@@ -1861,8 +2093,8 @@ ALIASES={
  "school_name":["schoolname","school"],
  "academic_year":["academicyear","schoolyear","academicy"],
  "grade_level":["gradelevel","academicgradelevel","grade"],
- "class_name":["course","coursesection","section","class","classname","studentla"],
- "student_id":["studentid","studentnumber","localid","sisid"],
+ "class_name":["room","homeroom","homeroomroom","course","coursesection","section","class","classname"],
+ "student_id":["studentid","externalstudentid","studentnumber","localid","sisid"],
  "student_first":["studentfirstname","studentfirst","studentfir","scholarfirstname","scholarfirst"],
  "student_last":["studentlastname","studentlast","studentla","scholarlastname","scholarlast"],
  "address":["address","streetaddress"],
@@ -1870,7 +2102,10 @@ ALIASES={
  "state_code":["statecode","state"],
  "zip_code":["zipcode","zip","postalcode"],
  "residency":["residency"],
- "guardian_first":["firstname","parentfirstname","guardianfirstname"],
+ "enrollment_status":["currentenrollmentstatus","enrollmentstatus","status"],
+ "homeroom_teacher_first":["homeroomteacherfirstname","homeroomteacherfirst"],
+ "homeroom_teacher_last":["homeroomteacherlastname","homeroomteacherlast"],
+ "guardian_first":["guardianfirstname","parentfirstname","firstname"],
  "guardian_last":["lastname","parentlastname","guardianlastname"],
  "relationship":["relationshiptypename","relationship","relation"],
  "home_phone":["homephone","homepho"],
@@ -5620,34 +5855,11 @@ with st.container(border=True):
                             st.rerun()
 
             st.markdown("---")
-            st.markdown("#### 🎭 Demo Class")
+            st.markdown("#### ✅ Live Roster Mode")
             st.caption(
-                "Turn on a safe fake class for demonstrations. Demo data is tagged separately "
-                "and can be hidden again without touching real classes or scholars."
+                "Demo Class is OFF. ChapLab is now set up for the live Grade 3 roster "
+                "using homerooms 3-207, 3-208, and 3-212."
             )
-            demo=demo_setting()
-            dm1,dm2=st.columns(2)
-            demo_enabled=dm1.toggle("Show Demo Class",value=bool(demo["enabled"]),key="creator_demo_enabled")
-            demo_grade=dm2.selectbox(
-                "Demo grade",
-                ["Kindergarten","Grade 1","Grade 2","Grade 3","Grade 4","Grade 5","Grade 6","Grade 7","Grade 8"],
-                index=(["Kindergarten","Grade 1","Grade 2","Grade 3","Grade 4","Grade 5","Grade 6","Grade 7","Grade 8"].index(demo["grade"])
-                       if demo["grade"] in ["Kindergarten","Grade 1","Grade 2","Grade 3","Grade 4","Grade 5","Grade 6","Grade 7","Grade 8"] else 3),
-                key="creator_demo_grade"
-            )
-            if st.button("Apply Demo Class Setting",key="apply_demo_setting",use_container_width=True):
-                cid=set_demo_mode(demo_enabled,demo_grade)
-                st.success(
-                    f"Demo Class is {'ON' if demo_enabled else 'OFF'}."
-                    + (f" Opened {demo_grade} demo data." if demo_enabled else "")
-                )
-                st.rerun()
-
-            if demo_enabled:
-                st.info(
-                    "Demo contains 3 fake scholars, 4 assignments across ELA/Math/Science/Social Studies, "
-                    "sample grades, and sample reading/assessment data."
-                )
 
             st.markdown("---")
             st.markdown("#### 🧪 Grade 3 Pilot Team")
@@ -6141,7 +6353,85 @@ elif page=="Class Dashboard":
 elif page=="Scholars":
     st.markdown('<div class="page-title">Scholars</div><div class="page-subtitle">Manage rosters and open scholar profiles.</div>',unsafe_allow_html=True)
 
-    st.markdown("### Add Scholars")
+    st.markdown("### 🏫 Grade 3 Live Roster")
+    st.caption(
+        "Upload your NHA **Student And Parent Information** spreadsheet whenever the roster changes. "
+        "ChapLab matches scholars by External Student ID, updates their information, and places them "
+        "in the room listed in the spreadsheet."
+    )
+
+    _counts=grade3_roster_counts()
+    rc1,rc2,rc3=st.columns(3)
+    rc1.metric("3-207",_counts.get("3-207",0),"Ms. Campbell")
+    rc2.metric("3-208",_counts.get("3-208",0),"Ms. Chapman")
+    rc3.metric("3-212",_counts.get("3-212",0),"Mr. Schroeder")
+
+    st.info(
+        "All Grade 3 teachers can switch between **3-207, 3-208, and 3-212**. "
+        "Uploading a newer roster updates matching students instead of duplicating them. "
+        "Students are never removed just because they are missing from a later upload."
+    )
+
+    _nha_roster=st.file_uploader(
+        "Upload Student And Parent Information",
+        type=["xlsx","xls","csv"],
+        key="grade3_nha_roster_quick_upload"
+    )
+
+    if _nha_roster is not None:
+        try:
+            if _nha_roster.name.lower().endswith(".csv"):
+                _nha_df=pd.read_csv(_nha_roster,dtype=str).fillna("")
+            else:
+                _nha_df=pd.read_excel(_nha_roster,dtype=str).fillna("")
+
+            if _nha_df.empty:
+                st.warning(
+                    "This spreadsheet has the correct headings but no student rows yet. "
+                    "Upload the populated copy when it is ready."
+                )
+            else:
+                _needed=["Student First Name","Student Last Name","External Student ID","Room"]
+                _norms={norm_header(c) for c in _nha_df.columns}
+                _missing=[x for x in _needed if norm_header(x) not in _norms]
+
+                if _missing:
+                    st.error(
+                        "This does not look like the expected NHA roster export. Missing: "
+                        +", ".join(_missing)
+                    )
+                else:
+                    st.success(f"Ready to update {len(_nha_df)} roster row(s).")
+                    _preview_cols=[
+                        c for c in [
+                            "Student First Name","Student Last Name","External Student ID",
+                            "Grade Level","Home Room Teacher First Name",
+                            "Home Room Teacher Last Name","Room"
+                        ] if c in _nha_df.columns
+                    ]
+                    st.dataframe(
+                        _nha_df[_preview_cols].head(15),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    if st.button(
+                        "✅ Update Grade 3 Roster",
+                        type="primary",
+                        use_container_width=True,
+                        key="apply_grade3_nha_roster"
+                    ):
+                        _result=import_nha_student_parent_roster(_nha_df,True)
+                        if _result.get("error"):
+                            st.error(_result["error"])
+                        else:
+                            st.success(_result["message"])
+                            st.rerun()
+        except Exception as e:
+            st.error(f"ChapLab could not read this roster file: {e}")
+
+    st.markdown("---")
+    st.markdown("### Add or Correct Scholars")
     add_mode=st.radio(
         "How would you like to add scholars?",
         ["Manual Entry","Roster Spreadsheet"],
@@ -6213,6 +6503,7 @@ elif page=="Scholars":
                                  academic_year.strip(),grade_level.strip(),student_id.strip(),
                                  address.strip(),city.strip(),state.strip(),zip_code.strip(),residency.strip()))
                             c.commit(); c.close()
+                            persist_database_now()
                             st.success(f"{first.strip()} {last.strip()} added to {cname}.")
                             st.rerun()
 
@@ -6314,6 +6605,7 @@ elif page=="Scholars":
                                       (hp,wp,cp,em,scholar_id,gf,gl,rel))
                                     guardian_count+=1
                             c.commit(); c.close()
+                            persist_database_now()
                             st.success(f"Import complete: {scholar_count} new scholars, {updated} profiles updated, and guardian/contact rows processed.")
                             st.rerun()
                 except Exception as e:
