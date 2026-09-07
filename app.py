@@ -1540,6 +1540,206 @@ def resolve_grade3_class(room_value="", teacher_first="", teacher_last=""):
 
     return room or "Grade 3 - Class Not Assigned"
 
+def is_nha_parent_address_class_export(df):
+    """Detect the actual NHA Student Parent Address Phone by Class export."""
+    if df is None:
+        return False
+    needed={
+        "schoolname","academicyearname","gradelevelname","coursesectiongroupname",
+        "studentlastname","studentfirstname","firstname","lastname",
+        "relationshiptypename"
+    }
+    cols={norm_header(c) for c in df.columns}
+    return needed.issubset(cols)
+
+def class_from_course_section_group(value):
+    """Map NHA CourseSectionGroupName to ChapLab Class A/B/C."""
+    s=str(value or "").strip().lower()
+    if "hr-a" in s or "campbell" in s:
+        return "Class A"
+    if "hr-b" in s or "schroeder" in s or "schroder" in s:
+        return "Class B"
+    if "hr-c" in s or "chapman" in s:
+        return "Class C"
+    return "Grade 3 - Class Not Assigned"
+
+def import_nha_parent_address_class_roster(df):
+    """
+    Import NHA 'Student Parent Address Phone by Class' export.
+
+    This report has no student ID and may repeat a student for multiple
+    parents/guardians. Scholars are matched by first name + last name + class.
+    """
+    if df is None or df.empty:
+        return {"new":0,"updated":0,"guardians":0,"skipped":0,
+                "message":"The roster has no student rows to import."}
+
+    col_by_norm={norm_header(c):c for c in df.columns}
+
+    def col(name):
+        return col_by_norm.get(norm_header(name))
+
+    def val(row,name):
+        c=col(name)
+        if not c:
+            return ""
+        try:
+            return clean(row[c])
+        except Exception:
+            return ""
+
+    required=[
+        "CourseSectionGroupName","StudentFirstName","StudentLastName",
+        "FirstName","LastName","RelationshipTypeName"
+    ]
+    missing=[name for name in required if not col(name)]
+    if missing:
+        return {"new":0,"updated":0,"guardians":0,"skipped":0,
+                "error":"Missing required roster column(s): "+", ".join(missing)}
+
+    c=conn(); cur=c.cursor()
+    new_count=0
+    updated_count=0
+    guardian_count=0
+    skipped=0
+    seen_scholars=set()
+    seen_guardians=set()
+
+    try:
+        for _,row in df.fillna("").iterrows():
+            first=val(row,"StudentFirstName").strip()
+            last=val(row,"StudentLastName").strip()
+            course=val(row,"CourseSectionGroupName")
+            class_name=class_from_course_section_group(course)
+
+            if not first or not last:
+                skipped+=1
+                continue
+
+            scholar_key=(norm_header(first),norm_header(last),class_name)
+
+            cur.execute(
+                """INSERT INTO classes(class_name,subject_note,active,is_demo)
+                   VALUES (?,?,1,0)
+                   ON CONFLICT(class_name) DO UPDATE SET active=1,is_demo=0""",
+                (class_name,"Imported from NHA Student Parent Address Phone by Class")
+            )
+            class_id=int(cur.execute(
+                "SELECT id FROM classes WHERE class_name=?",(class_name,)
+            ).fetchone()["id"])
+
+            existing=cur.execute(
+                """SELECT * FROM scholars
+                   WHERE lower(trim(first_name))=lower(trim(?))
+                     AND lower(trim(last_name))=lower(trim(?))
+                     AND class_id=?
+                   LIMIT 1""",
+                (first,last,class_id)
+            ).fetchone()
+
+            school=val(row,"SchoolName")
+            academic_year=val(row,"AcademicYearName") or current_academic_year()
+            grade=val(row,"GradeLevelName") or "3"
+            address=val(row,"Address")
+            city=val(row,"City")
+            state=val(row,"StateCode")
+            zip_code=val(row,"ZipCode")
+
+            if existing:
+                scholar_id=int(existing["id"])
+                if scholar_key not in seen_scholars:
+                    cur.execute(
+                        """UPDATE scholars SET
+                           first_name=?,last_name=?,class_name=?,class_id=?,
+                           school_name=?,academic_year=?,grade_level=?,
+                           address=?,city=?,state_code=?,zip_code=?,
+                           active=1,is_demo=0
+                           WHERE id=?""",
+                        (first,last,class_name,class_id,school,academic_year,grade,
+                         address,city,state,zip_code,scholar_id)
+                    )
+                    updated_count+=1
+            else:
+                cur.execute(
+                    """INSERT INTO scholars(
+                       first_name,last_name,class_name,class_id,school_name,
+                       academic_year,grade_level,address,city,state_code,zip_code,
+                       active,is_demo)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,1,0)""",
+                    (first,last,class_name,class_id,school,academic_year,grade,
+                     address,city,state,zip_code)
+                )
+                scholar_id=int(cur.lastrowid)
+                new_count+=1
+
+            seen_scholars.add(scholar_key)
+
+            guardian_first=val(row,"FirstName").strip()
+            guardian_last=val(row,"LastName").strip()
+            relationship=val(row,"RelationshipTypeName").strip()
+            home_phone=val(row,"HomePhone").strip()
+            work_phone=val(row,"WorkPhone").strip()
+            cell_phone=val(row,"CellPhone").strip()
+
+            if guardian_first or guardian_last or home_phone or work_phone or cell_phone:
+                guardian_key=(
+                    scholar_id,norm_header(guardian_first),norm_header(guardian_last),
+                    norm_header(relationship),home_phone,work_phone,cell_phone
+                )
+                if guardian_key not in seen_guardians:
+                    existing_guardian=cur.execute(
+                        """SELECT id FROM guardians
+                           WHERE scholar_id=?
+                             AND lower(trim(COALESCE(first_name,'')))=lower(trim(?))
+                             AND lower(trim(COALESCE(last_name,'')))=lower(trim(?))
+                             AND lower(trim(COALESCE(relationship,'')))=lower(trim(?))
+                           LIMIT 1""",
+                        (scholar_id,guardian_first,guardian_last,relationship)
+                    ).fetchone()
+
+                    if existing_guardian:
+                        cur.execute(
+                            """UPDATE guardians SET
+                               home_phone=CASE WHEN ?<>'' THEN ? ELSE home_phone END,
+                               work_phone=CASE WHEN ?<>'' THEN ? ELSE work_phone END,
+                               cell_phone=CASE WHEN ?<>'' THEN ? ELSE cell_phone END
+                               WHERE id=?""",
+                            (home_phone,home_phone,work_phone,work_phone,
+                             cell_phone,cell_phone,int(existing_guardian["id"]))
+                        )
+                    else:
+                        cur.execute(
+                            """INSERT INTO guardians(
+                               scholar_id,first_name,last_name,relationship,
+                               home_phone,work_phone,cell_phone,email)
+                               VALUES (?,?,?,?,?,?,?,'')""",
+                            (scholar_id,guardian_first,guardian_last,relationship,
+                             home_phone,work_phone,cell_phone)
+                        )
+
+                    guardian_count+=1
+                    seen_guardians.add(guardian_key)
+
+        c.commit()
+    except Exception:
+        c.rollback(); c.close(); raise
+
+    c.close()
+    persist_database_now()
+
+    return {
+        "new":new_count,
+        "updated":updated_count,
+        "guardians":guardian_count,
+        "skipped":skipped,
+        "scholars_processed":len(seen_scholars),
+        "message":(
+            f"Roster update complete: {len(seen_scholars)} unique scholar(s) processed "
+            f"({new_count} new, {updated_count} updated) and "
+            f"{guardian_count} guardian/contact row(s) processed."
+        )
+    }
+
 def import_nha_student_parent_roster(df, update_existing=True):
     """Import/update the NHA Student And Parent Information export."""
     if df is None or df.empty:
@@ -6392,9 +6592,9 @@ elif page=="Scholars":
 
     st.markdown("### 🏫 Grade 3 Live Roster")
     st.caption(
-        "Upload your NHA **Student And Parent Information** spreadsheet whenever the roster changes. "
-        "ChapLab matches scholars by External Student ID, updates their information, and places them "
-        "into Class A, B, or C using the Room or Home Room Teacher fields."
+        "Upload either NHA Grade 3 roster export whenever the roster changes. "
+        "ChapLab recognizes the Student Parent Address Phone by Class report as well as the "
+        "Student And Parent Information report and places scholars into Class A, B, or C."
     )
 
     _counts=grade3_roster_counts()
@@ -6412,7 +6612,7 @@ elif page=="Scholars":
     )
 
     _nha_roster=st.file_uploader(
-        "Upload Student And Parent Information",
+        "Upload NHA Grade 3 Roster",
         type=["xlsx","xls","csv"],
         key="grade3_nha_roster_quick_upload"
     )
@@ -6427,9 +6627,60 @@ elif page=="Scholars":
             if _nha_df.empty:
                 st.warning(
                     "ChapLab can read this file, but it contains 0 student rows. "
-                    "It has column headings only, so there are no scholars to import. "
-                    "Download/export the populated Student And Parent Information roster, then upload that copy."
+                    "It has column headings only, so there are no scholars to import."
                 )
+
+            elif is_nha_parent_address_class_export(_nha_df):
+                _unique_students=_nha_df[
+                    ["StudentFirstName","StudentLastName","CourseSectionGroupName"]
+                ].drop_duplicates()
+
+                _class_labels=_unique_students["CourseSectionGroupName"].apply(
+                    class_from_course_section_group
+                )
+                _class_counts=_class_labels.value_counts().to_dict()
+
+                st.success(
+                    f"Recognized NHA Student Parent Address Phone by Class roster: "
+                    f"{len(_unique_students)} unique scholar(s)."
+                )
+
+                c1,c2,c3=st.columns(3)
+                c1.metric("Class A",int(_class_counts.get("Class A",0)),"Campbell + Davidson")
+                c2.metric("Class B",int(_class_counts.get("Class B",0)),"Schroeder")
+                c3.metric("Class C",int(_class_counts.get("Class C",0)),"Chapman")
+
+                _preview_cols=[
+                    c for c in [
+                        "StudentFirstName","StudentLastName","CourseSectionGroupName",
+                        "FirstName","LastName","RelationshipTypeName","CellPhone"
+                    ] if c in _nha_df.columns
+                ]
+                st.dataframe(
+                    _nha_df[_preview_cols].head(20),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                st.caption(
+                    "This report can contain several rows for one scholar because each parent/guardian "
+                    "may have a separate row. ChapLab creates one scholar profile and attaches the "
+                    "available guardian contacts to that profile."
+                )
+
+                if st.button(
+                    "✅ Import This Grade 3 Roster",
+                    type="primary",
+                    use_container_width=True,
+                    key="apply_actual_nha_roster"
+                ):
+                    _result=import_nha_parent_address_class_roster(_nha_df)
+                    if _result.get("error"):
+                        st.error(_result["error"])
+                    else:
+                        st.success(_result["message"])
+                        st.rerun()
+
             else:
                 _needed=["Student First Name","Student Last Name","External Student ID","Room"]
                 _norms={norm_header(c) for c in _nha_df.columns}
@@ -6437,7 +6688,7 @@ elif page=="Scholars":
 
                 if _missing:
                     st.error(
-                        "This does not look like the expected NHA roster export. Missing: "
+                        "ChapLab does not recognize this roster format yet. Missing: "
                         +", ".join(_missing)
                     )
                 else:
@@ -6467,6 +6718,7 @@ elif page=="Scholars":
                         else:
                             st.success(_result["message"])
                             st.rerun()
+
         except Exception as e:
             st.error(f"ChapLab could not read this roster file: {e}")
 
